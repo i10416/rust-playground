@@ -1,27 +1,27 @@
 [package]
 author = ["110416"]
-name = "template"
-description = "rust project template"
-category = []
+name = "playground"
+description = "rust playground"
+category = ["palyground"]
 version = "0.1.0"
 edition = "2018"
-keyword = []
+keyword = ["rust"]
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/ItoYo16u/rust-template"
+repository = "https://github.com/ItoYo16u/rust-playground"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-# macro
-#[lib]
-# proc-macro = true
+[lib]
+#proc-macro = true
 
 [dependencies]
 
-# macro support
-# proc-macro2 = "^1.0.24"
-# quote = "^1.0.9"
-# syn = "1.0.64"
+#proc-macro2 = "^1.0.24"
+#quote = "^1.0.9"
+#syn = "1.0.64"
+
+# system
+# nix = "0.19.0"
+# dirs
 
 # http
 reqwest = "^0.11"
