@@ -3,7 +3,7 @@ pub mod file_io {
     use std::io::{prelude::*, BufReader};
     use std::path::Path;
 
-    // expect: `linecounts    wordcounts    bytecounts    filename\n
+    // expect: `linecounts    wordcounts    bytecounts    filepath\n
     pub fn wc(p: &str) -> Result<String, String> {
         let path = Path::new(p);
         let (size, words, lines) = count_all(path);
@@ -23,7 +23,7 @@ pub mod file_io {
         acc: (usize, usize, usize),
     ) -> (usize, usize, usize) {
         match reader.read_line(&mut buf) {
-            // reach the end of the file or file contains 0 byte
+            // There remains 0 byte unread in the file.
             Ok(n) if n <= 0 => (
                 acc.0 + count_bytes(&reader),
                 acc.1 + count_words_by_line(&buf),
@@ -44,9 +44,6 @@ pub mod file_io {
     fn count_words_by_line(s: &String) -> usize {
         s.split(" ")
             .fold(0, |acc, word| if word.is_empty() { acc } else { acc + 1 })
-    }
-    fn count_line_ends(r: &BufReader<File>) -> usize {
-        r.buffer().iter().filter(|b| (**b as char) == '\n').count()
     }
 
     fn fmt(linecount: usize, wordcount: usize, bytecount: usize, filename: String) -> String {
