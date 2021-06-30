@@ -27,7 +27,7 @@ pub mod file_io {
             Ok(n) if n <= 0 => (
                 acc.0 + count_bytes(&reader),
                 acc.1 + count_words_by_line(&buf),
-                acc.2 + count_line_ends(&reader),
+                acc.2 + 1,
             ),
             Ok(n) => {
                 let ws = count_words_by_line(&buf);
