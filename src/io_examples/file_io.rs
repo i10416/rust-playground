@@ -1,4 +1,5 @@
 pub mod file_io {
+    use std::env;
     use std::fs::File;
     use std::io::{prelude::*, BufReader};
     use std::path::Path;
@@ -52,5 +53,11 @@ pub mod file_io {
             linecount, wordcount, bytecount, filename
         );
         s
+    }
+    pub fn set_dir(s:&str) {
+        let path = Path::new(s);
+        if let Err(e) = env::set_current_dir(&path) {
+            eprintln!("{}", e);
+        }
     }
 }
