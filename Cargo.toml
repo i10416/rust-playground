@@ -49,4 +49,9 @@ serde_derive= "^1.0.24"
 
 [build-dependencies]
 
+[[bin]]
+name = "shell-rs"
+path = "src/app/shell.rs"
+
+
 
