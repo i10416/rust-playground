@@ -10,15 +10,11 @@ antirez's kilo を少し改変したテキストエディタをRustで書く.
 
  */
 
-use std::borrow::BorrowMut;
-use std::fmt::{Debug, Display};
+use std::fmt::Debug;
 
 // user input -> stdin variable -> `program world`
 use std::io::{self, Read, Write};
-use std::mem::size_of;
 use std::os::raw::{c_char, c_uint};
-use std::ptr::{null, NonNull};
-
 
 type Cflag = c_uint;
 type Speed = c_uint;
@@ -88,7 +84,8 @@ fn main() -> Result<(), ()> {
         } else {
             None
         }
-    }.unwrap();
+    }
+    .unwrap();
 
     match read_rec() {
         Ok(result) => {
@@ -101,15 +98,13 @@ fn main() -> Result<(), ()> {
         Err(_) => unimplemented!(),
     }
 }
+fn clean_display() -> () {
+    io::stdout().write(&"\x1b[2J\x1b[H".as_bytes()).unwrap();
+}
 fn read_rec() -> Result<String, String> {
+    clean_display();
     match io::stdin().bytes().next() {
-        Some(Ok(b)) if (b as char) == 'q' => Ok(String::from("exit!")),
-        Some(Ok(b)) if (b as char).is_control() => {
-            print!("{}", b as char);
-            // disable buffer
-            io::stdout().flush().expect("success");
-            read_rec()
-        }
+        Some(Ok(b)) if b == ('q' as u8) & 0x1f => Ok(String::from("exit!")),
         Some(Ok(b)) => {
             print!("{}", b as char);
             // disable buffer
