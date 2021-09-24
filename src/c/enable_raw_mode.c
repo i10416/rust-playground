@@ -9,7 +9,7 @@ struct termios  enable_raw_mode() {
     raw = original;
     // Not との積をとるので echo のフラグは必ず0
     // に、それ以外は１をかけるのでそのままの状態になる.
-    raw.c_lflag &= ~(ECHO);
+    raw.c_lflag &= ~(ECHO | ICANON);
     // TSCAFLUSH defines when to apply the change.
     // in this case, it waits for all pending output to be written to the terminal and discard any input that hasn't been read
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
