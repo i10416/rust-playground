@@ -1,4 +1,4 @@
 #include <termio.h>
 
-struct termios enable_raw_mode();
+int enable_raw_mode(struct termios * original);
 int restore(struct termios * original);

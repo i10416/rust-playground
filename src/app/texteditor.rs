@@ -10,17 +10,21 @@ antirez's kilo を少し改変したテキストエディタをRustで書く.
 
  */
 
+use std::borrow::BorrowMut;
 use std::fmt::{Debug, Display};
+
 // user input -> stdin variable -> `program world`
-//
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
+use std::mem::size_of;
 use std::os::raw::{c_char, c_uint};
+use std::ptr::{null, NonNull};
+
+
 type Cflag = c_uint;
 type Speed = c_uint;
 const NCCS: usize = 32;
-
 #[repr(C)]
-struct Termios {
+pub struct Termios {
     c_iflag: Cflag,       /* input mode flags */
     c_oflag: Cflag,       /* output mode flags */
     c_cflag: Cflag,       /* control mode flags */
@@ -55,19 +59,40 @@ impl std::fmt::Display for Termios {
     }
 }
 
+impl Default for Termios {
+    fn default() -> Self {
+        Self {
+            c_iflag: Default::default(),
+            c_oflag: Default::default(),
+            c_cflag: Default::default(),
+            c_lflag: Default::default(),
+            c_line: Default::default(),
+            c_cc: Default::default(),
+            c_ispeed: Default::default(),
+            c_ospeed: Default::default(),
+        }
+    }
+}
+
 #[link(name = "enable_raw_mode.a")]
 extern "C" {
-    fn enable_raw_mode() -> Termios;
+    fn enable_raw_mode(priginal: *mut Termios) -> i32;
     fn restore(original: *const Termios) -> i32;
 }
 
 fn main() -> Result<(), ()> {
-    let original = unsafe { enable_raw_mode() };
-    println!("{}", original);
-    let buf = String::new();
-    match read_rec(buf) {
+    let original = unsafe {
+        let mut t = Termios::default();
+        if enable_raw_mode(&mut t) == 0 {
+            Some(t)
+        } else {
+            None
+        }
+    }.unwrap();
+
+    match read_rec() {
         Ok(result) => {
-            println!("result is {}", result);
+            println!("{}", result);
             unsafe {
                 restore(&original);
             }
@@ -76,33 +101,25 @@ fn main() -> Result<(), ()> {
         Err(_) => unimplemented!(),
     }
 }
-fn read_rec(mut buf: String) -> Result<String, String> {
-    match io::stdin().read_to_string(&mut buf) {
-        Ok(_) if buf.as_str().contains("q") => Ok(buf),
-        Ok(_) => read_rec(buf),
-        Err(_) => unimplemented!(),
+fn read_rec() -> Result<String, String> {
+    match io::stdin().bytes().next() {
+        Some(Ok(b)) if (b as char) == 'q' => Ok(String::from("exit!")),
+        Some(Ok(b)) if (b as char).is_control() => {
+            print!("{}", b as char);
+            // disable buffer
+            io::stdout().flush().expect("success");
+            read_rec()
+        }
+        Some(Ok(b)) => {
+            print!("{}", b as char);
+            // disable buffer
+            io::stdout().flush().expect("success");
+            read_rec()
+        }
+        Some(Err(_)) => unimplemented!(),
+        None => {
+            io::stdout().flush().expect("success");
+            read_rec()
+        }
     }
 }
-
-// todo: echo
-// note: Rustのプログラムでは必ずCの標準ライブラリがリンクされている
-// https://qiita.com/deta-mamoru/items/045c5569ebf2cf39c29e
-/*
-use std::os::raw::c_int;
-extern {
-    fn abs(n: c_int) -> c_int;
-}
-fn main() {
-    unsafe {
-        println!("{}", abs(-1)); // 1
-    }
-}
-*/
-// externブロックの上に#[link(...)]属性を付けることで、特定のライブラリの関数を宣言することができる
-/*
-#[link(name="libname")]
-extern {
-    fn fn_name();
-}
-*/
-// user input -> stdin -> do something -> stdout
