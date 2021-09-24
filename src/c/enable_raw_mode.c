@@ -2,7 +2,7 @@
 #include <unistd.h>
 #include "enable_raw_mode.h"
 
-struct termios enable_raw_mode() {
+struct termios  enable_raw_mode() {
     struct termios original;
     struct termios raw;
     tcgetattr(STDIN_FILENO, &original);
@@ -14,4 +14,8 @@ struct termios enable_raw_mode() {
     // in this case, it waits for all pending output to be written to the terminal and discard any input that hasn't been read
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
     return original;
+}
+
+int  restore(struct termios * original) {
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &original);
 }
