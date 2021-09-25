@@ -76,12 +76,17 @@ extern "C" {
 #[derive(Debug)]
 struct State {
     termios: Termios,
+    cursor: terminal::Cursor,
     size: terminal::TermSize,
 }
 
 impl State {
-    fn new(t: Termios, size: terminal::TermSize) -> State {
-        State { termios: t, size: size }
+    fn new(t: Termios, size: terminal::TermSize, cursor: terminal::Cursor) -> State {
+        State {
+            termios: t,
+            size: size,
+            cursor: cursor,
+        }
     }
 }
 
@@ -96,26 +101,27 @@ fn main() -> Result<(), ()> {
     }
     .unwrap();
     let term_size = terminal::get_terminal_size().unwrap();
-    let state = State::new(original, term_size);
+    let (_, cursor) = terminal::Cursor::origin();
+    let state = State::new(original, term_size, cursor);
 
     match tick(state) {
         Ok((message, state)) => {
-            clean_display();
+            let clean_cmd = clean_display();
             unsafe {
                 restore(&state.termios);
             }
-            println!("{}", message);
+            println!("{}", clean_cmd + &message);
             Ok(())
         }
         Err(_) => unimplemented!(),
     }
 }
 fn clean_display() -> String {
-    String::from("\x1b[2J\x1b[H")
+    String::from("\x1b[2J")
 }
 
-fn build_row(content: &str) -> String {
-    String::from(format!("~ {}", content))
+fn build_row(content: &str, idx: usize) -> String {
+    String::from(format!("~{} {}", idx, content))
 }
 fn build_screen(rows: Vec<String>) -> String {
     rows.into_iter().fold(String::new(), |acc, s| acc + &s + "\r\n")
@@ -126,6 +132,7 @@ fn render_screen(rows: Vec<String>) {
 }
 
 fn tick(state: State) -> Result<(String, State), String> {
+    let (hide_cursor_cmd, cursor) = state.cursor.hide();
     let clean_cmd = clean_display();
     match io::stdin().bytes().next() {
         Some(Ok(input)) if input == ('q' as u8) & 0x1f => Ok((clean_cmd + "Bye!", state)),
@@ -133,23 +140,43 @@ fn tick(state: State) -> Result<(String, State), String> {
             let textarea = build_screen(
                 (0..state.size.row)
                     .into_iter()
-                    .map(|_| build_row(&format!("{:?}", state.size)))
+                    .zip(0..)
+                    .map(|(row, idx)| build_row(&format!("{:?}", state.size), idx))
                     .collect(),
             );
-            let (cmd, _) = terminal::Cursor::origin();
-            io::stdout().write((clean_cmd + &textarea + &cmd).as_bytes()).unwrap();
+            let (show_cursor_cmd, cursor) = cursor.show();
+            io::stdout()
+                .write((clean_cmd + &hide_cursor_cmd + &textarea + &show_cursor_cmd).as_bytes())
+                .unwrap();
             // disable buffer
             io::stdout().flush().expect("success");
-            tick(state)
+            tick(State {
+                size: state.size,
+                cursor: cursor,
+                termios: state.termios,
+            })
         }
         Some(Err(_)) => unimplemented!(),
         None => {
-            let textarea = build_screen((0..state.size.row).into_iter().map(|_| build_row("")).collect());
+            let textarea = build_screen(
+                (0..state.size.row)
+                    .into_iter()
+                    .into_iter()
+                    .zip(0..)
+                    .map(|(row, idx)| build_row("", idx))
+                    .collect(),
+            );
 
-            let (cmd, _) = terminal::Cursor::origin();
-            io::stdout().write((clean_cmd + &textarea + &cmd).as_bytes()).unwrap();
+            let (show_cursor_cmd, cursor) = cursor.show();
+            io::stdout()
+                .write((clean_cmd + &textarea + &show_cursor_cmd).as_bytes())
+                .unwrap();
             io::stdout().flush().expect("success");
-            tick(state)
+            tick(State {
+                size: state.size,
+                cursor: cursor,
+                termios: state.termios,
+            })
         }
     }
 }
@@ -158,6 +185,7 @@ mod terminal {
     use std::io::{self, Read, Write};
     use std::os::raw::c_short;
 
+    #[derive(Debug)]
     pub struct Cursor {
         row: usize,
         col: usize,
@@ -183,6 +211,12 @@ mod terminal {
             };
             (format!("\x1b[{}C\x1b[{}B", next.row, next.col), next)
         }
+
+        pub fn move_to(&self, col: usize, row: usize) -> (String, Cursor) {
+            let (origin_cmd, cursor) = Cursor::origin();
+            cursor.move_by(col, row)
+        }
+
         pub fn hide(&self) -> (String, Cursor) {
             (
                 format!("\x1b[?25l"),
@@ -195,6 +229,8 @@ mod terminal {
         }
         pub fn show(&self) -> (String, Cursor) {
             (
+                // cursor.visibility = true
+                // todo: cursor.position
                 format!("\x1b[?25h"),
                 Cursor {
                     row: self.row,
