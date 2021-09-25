@@ -19,6 +19,7 @@ use std::os::raw::{c_char, c_uint};
 type Cflag = c_uint;
 type Speed = c_uint;
 const NCCS: usize = 32;
+// メモリレイアウトの最適化をしないようにする
 #[repr(C)]
 pub struct Termios {
     c_iflag: Cflag,       /* input mode flags */
@@ -101,18 +102,55 @@ fn main() -> Result<(), ()> {
 fn clean_display() -> () {
     io::stdout().write(&"\x1b[2J\x1b[H".as_bytes()).unwrap();
 }
+
+struct Cursor {
+    row: usize,
+    col: usize,
+}
+
+impl Cursor {
+    fn origin() -> (String, Cursor) {
+        (String::from("\x1b[H"), Cursor { row: 0, col: 0 })
+    }
+    fn move_by(&self, x: usize, y: usize) -> (String, Cursor) {
+        unimplemented!()
+    }
+}
+
+fn build_row(content: &str) -> String {
+    String::from(format!("~ {}", content))
+}
+fn build_screen(rows: Vec<String>) -> String {
+    rows.into_iter().fold(String::new(), |acc, s| acc + &s + "\r\n")
+}
+// todo: render_screen(previous_state,reducer)
+fn render_screen(rows: Vec<String>) {
+    rows.into_iter().zip((0..)).for_each(|(row, row_number)| {})
+}
+
 fn read_rec() -> Result<String, String> {
     clean_display();
     match io::stdin().bytes().next() {
-        Some(Ok(b)) if b == ('q' as u8) & 0x1f => Ok(String::from("exit!")),
-        Some(Ok(b)) => {
-            print!("{}", b as char);
+        Some(Ok(input)) if input == ('q' as u8) & 0x1f => Ok(String::from("exit!")),
+        Some(Ok(_)) => {
+            print!(
+                "{}",
+                build_screen((0..24).into_iter().map(|_| { build_row("") }).collect())
+            );
+            let (cmd, _) = Cursor::origin();
+            io::stdout().write(cmd.as_bytes()).unwrap();
             // disable buffer
             io::stdout().flush().expect("success");
             read_rec()
         }
         Some(Err(_)) => unimplemented!(),
         None => {
+            print!(
+                "{}",
+                build_screen((0..24).into_iter().map(|_| { build_row("") }).collect())
+            );
+            let (cmd, _) = Cursor::origin();
+            io::stdout().write(cmd.as_bytes()).unwrap();
             io::stdout().flush().expect("success");
             read_rec()
         }
