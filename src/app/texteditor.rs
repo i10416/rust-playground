@@ -11,7 +11,6 @@ antirez's kilo を少し改変したテキストエディタをRustで書く.
  */
 
 use std::fmt::Debug;
-
 // user input -> stdin variable -> `program world`
 use std::io::{self, Read, Write};
 use std::os::raw::{c_char, c_uint};
@@ -71,10 +70,20 @@ impl Default for Termios {
     }
 }
 
-#[link(name = "enable_raw_mode.a")]
+#[link(name = "texteditor.a")]
 extern "C" {
-    fn enable_raw_mode(priginal: *mut Termios) -> i32;
+    fn enable_raw_mode(original: *mut Termios) -> i32;
     fn restore(original: *const Termios) -> i32;
+}
+
+struct State {
+    termios: Termios,
+}
+
+impl State {
+    fn new(t: Termios) -> State {
+        State { termios: t }
+    }
 }
 
 fn main() -> Result<(), ()> {
@@ -87,12 +96,13 @@ fn main() -> Result<(), ()> {
         }
     }
     .unwrap();
+    let state = State::new(original);
 
     match read_rec() {
         Ok(result) => {
-            println!("{}", result);
+            clean_display();
             unsafe {
-                restore(&original);
+                restore(&state.termios);
             }
             Ok(())
         }
@@ -131,7 +141,7 @@ fn render_screen(rows: Vec<String>) {
 fn read_rec() -> Result<String, String> {
     clean_display();
     match io::stdin().bytes().next() {
-        Some(Ok(input)) if input == ('q' as u8) & 0x1f => Ok(String::from("exit!")),
+        Some(Ok(input)) if input == ('q' as u8) & 0x1f => Ok(String::from("Bye!")),
         Some(Ok(_)) => {
             print!(
                 "{}",
@@ -156,3 +166,32 @@ fn read_rec() -> Result<String, String> {
         }
     }
 }
+
+
+
+mod terminal {
+    #[derive(Default)]
+    #[repr(C)]
+    struct TermSize {
+        row: usize,
+        col: usize
+    }
+
+    #[link(name = "texteditor.a")]
+    extern "C" {
+        fn terminal_size(size: *mut TermSize) -> i32;
+    }
+    type ColCount = usize;
+    type RowCount = usize;
+
+    fn get_terminal_size() -> Option<(ColCount,RowCount)> {
+        let mut size = TermSize::default();
+        match unsafe {
+            terminal_size(&mut size)
+        }  {
+            0 => Some((size.col,size.row)),
+            _ => None
+        }
+    }
+}
+
