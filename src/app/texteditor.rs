@@ -15,6 +15,7 @@ use std::os::raw::{c_char, c_uint};
 type Cflag = c_uint;
 type Speed = c_uint;
 const NCCS: usize = 32;
+const KILO_VERSION: &str = "0.0.0";
 // prevent memory layout optimization
 #[repr(C)]
 pub struct Termios {
@@ -121,7 +122,7 @@ fn clean_display() -> String {
 }
 
 fn build_row(content: &str, idx: usize) -> String {
-    String::from(format!("~{} {}", idx, content))
+    String::from(format!("~{}:{} {}", idx, clean_line(), content))
 }
 fn build_screen(rows: Vec<String>) -> String {
     rows.into_iter().fold(String::new(), |acc, s| acc + &s + "\r\n")
@@ -130,23 +131,37 @@ fn build_screen(rows: Vec<String>) -> String {
 fn render_screen(rows: Vec<String>) {
     rows.into_iter().zip((0..)).for_each(|(row, row_number)| {})
 }
+fn clean_line() -> String {
+    String::from("\x1b[K")
+}
+
+fn build_welcome_message(col_count: u16, row_number: usize) -> String {
+    match format!("Kilo Editor -- version {}", KILO_VERSION) {
+        s if s.len() > col_count.into() => s[..col_count.into()].to_string(),
+        s => {
+            format!("~{}:", row_number)
+                + &" ".repeat((col_count as usize) / 2 - s.len() / 2 - 2)
+                + &s
+                + &" ".repeat((col_count as usize) / 2 - s.len() / 2)
+        }
+    }
+}
 
 fn tick(state: State) -> Result<(String, State), String> {
     let (hide_cursor_cmd, cursor) = state.cursor.hide();
-    let clean_cmd = clean_display();
     match io::stdin().bytes().next() {
-        Some(Ok(input)) if input == ('q' as u8) & 0x1f => Ok((clean_cmd + "Bye!", state)),
+        Some(Ok(input)) if input == ('q' as u8) & 0x1f => Ok((clean_display() + "Bye!", state)),
         Some(Ok(_)) => {
             let textarea = build_screen(
                 (0..state.size.row)
                     .into_iter()
                     .zip(0..)
-                    .map(|(row, idx)| build_row(&format!("{:?}", state.size), idx))
+                    .map(|(row, idx)| build_row("", idx))
                     .collect(),
             );
             let (show_cursor_cmd, cursor) = cursor.show();
             io::stdout()
-                .write((clean_cmd + &hide_cursor_cmd + &textarea + &show_cursor_cmd).as_bytes())
+                .write((hide_cursor_cmd + &textarea + &show_cursor_cmd).as_bytes())
                 .unwrap();
             // disable buffer
             io::stdout().flush().expect("success");
@@ -163,14 +178,18 @@ fn tick(state: State) -> Result<(String, State), String> {
                     .into_iter()
                     .into_iter()
                     .zip(0..)
-                    .map(|(row, idx)| build_row("", idx))
+                    .map(|(row, idx)| {
+                        if row == state.size.row / 3 {
+                            build_welcome_message(state.size.col, idx)
+                        } else {
+                            build_row("", idx)
+                        }
+                    })
                     .collect(),
             );
 
             let (show_cursor_cmd, cursor) = cursor.show();
-            io::stdout()
-                .write((clean_cmd + &textarea + &show_cursor_cmd).as_bytes())
-                .unwrap();
+            io::stdout().write((textarea + &show_cursor_cmd).as_bytes()).unwrap();
             io::stdout().flush().expect("success");
             tick(State {
                 size: state.size,
@@ -183,7 +202,7 @@ fn tick(state: State) -> Result<(String, State), String> {
 
 mod terminal {
     use std::io::{self, Read, Write};
-    use std::os::raw::c_short;
+    use std::os::raw::c_ushort;
 
     #[derive(Debug)]
     pub struct Cursor {
@@ -214,7 +233,8 @@ mod terminal {
 
         pub fn move_to(&self, col: usize, row: usize) -> (String, Cursor) {
             let (origin_cmd, cursor) = Cursor::origin();
-            cursor.move_by(col, row)
+            let (move_cmd, cursor) = cursor.move_by(col, row);
+            (origin_cmd + &move_cmd, cursor)
         }
 
         pub fn hide(&self) -> (String, Cursor) {
@@ -244,8 +264,8 @@ mod terminal {
     #[derive(Default, Debug)]
     #[repr(C)]
     pub struct TermSize {
-        pub row: c_short,
-        pub col: c_short,
+        pub row: c_ushort,
+        pub col: c_ushort,
     }
 
     #[link(name = "texteditor.a")]
@@ -268,7 +288,7 @@ mod terminal {
         }
     }
 
-    pub fn get_term_size_fallback() -> Result<(i16, i16), std::io::Error> {
+    pub fn get_term_size_fallback() -> Result<(u16, u16), std::io::Error> {
         let (cmd, _) = Cursor::origin().1.move_by(999, 999);
         // attempt to move cursor at right bottom
         io::stdout().write(cmd.as_bytes())?;
@@ -280,7 +300,7 @@ mod terminal {
         }
     }
 
-    fn read_res() -> Option<(i16, i16)> {
+    fn read_res() -> Option<(u16, u16)> {
         let result = io::stdin()
             .bytes()
             .take_while(|res| match res {
@@ -294,7 +314,7 @@ mod terminal {
             .flat_map(|c| c.map(|c| c as char))
             .fold(String::new(), |acc, input| acc + &input.to_string());
         result.strip_prefix("\x1b[").and_then(|s| {
-            match s.split(";").map(|s| s.parse().unwrap()).collect::<Vec<i16>>()[..2] {
+            match s.split(";").map(|s| s.parse().unwrap()).collect::<Vec<u16>>()[..2] {
                 [row, col] => Some((row, col)),
                 _ => None,
             }
