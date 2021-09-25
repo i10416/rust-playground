@@ -13,7 +13,7 @@ antirez's kilo を少し改変したテキストエディタをRustで書く.
 use std::fmt::Debug;
 // user input -> stdin variable -> `program world`
 use std::io::{self, Read, Write};
-use std::os::raw::{c_char, c_uint};
+use std::os::raw::{c_char, c_short, c_uint};
 
 type Cflag = c_uint;
 type Speed = c_uint;
@@ -76,13 +76,15 @@ extern "C" {
     fn restore(original: *const Termios) -> i32;
 }
 
+#[derive(Debug)]
 struct State {
     termios: Termios,
+    size: terminal::TermSize,
 }
 
 impl State {
-    fn new(t: Termios) -> State {
-        State { termios: t }
+    fn new(t: Termios, size: terminal::TermSize) -> State {
+        State { termios: t, size: size }
     }
 }
 
@@ -96,10 +98,11 @@ fn main() -> Result<(), ()> {
         }
     }
     .unwrap();
-    let state = State::new(original);
+    let term_size = terminal::get_terminal_size().unwrap();
+    let state = State::new(original, term_size);
 
-    match read_rec() {
-        Ok(result) => {
+    match read_rec(state) {
+        Ok((message, state)) => {
             clean_display();
             unsafe {
                 restore(&state.termios);
@@ -138,20 +141,25 @@ fn render_screen(rows: Vec<String>) {
     rows.into_iter().zip((0..)).for_each(|(row, row_number)| {})
 }
 
-fn read_rec() -> Result<String, String> {
+fn read_rec(state: State) -> Result<(String, State), String> {
     clean_display();
     match io::stdin().bytes().next() {
-        Some(Ok(input)) if input == ('q' as u8) & 0x1f => Ok(String::from("Bye!")),
+        Some(Ok(input)) if input == ('q' as u8) & 0x1f => Ok((String::from("Bye!"), state)),
         Some(Ok(_)) => {
             print!(
                 "{}",
-                build_screen((0..24).into_iter().map(|_| { build_row("") }).collect())
+                build_screen(
+                    (0..24)
+                        .into_iter()
+                        .map(|_| { build_row(&format!("{:?}", state.size)) })
+                        .collect()
+                )
             );
             let (cmd, _) = Cursor::origin();
             io::stdout().write(cmd.as_bytes()).unwrap();
             // disable buffer
             io::stdout().flush().expect("success");
-            read_rec()
+            read_rec(state)
         }
         Some(Err(_)) => unimplemented!(),
         None => {
@@ -162,19 +170,19 @@ fn read_rec() -> Result<String, String> {
             let (cmd, _) = Cursor::origin();
             io::stdout().write(cmd.as_bytes()).unwrap();
             io::stdout().flush().expect("success");
-            read_rec()
+            read_rec(state)
         }
     }
 }
 
-
-
 mod terminal {
-    #[derive(Default)]
+    use std::os::raw::c_short;
+
+    #[derive(Default, Debug)]
     #[repr(C)]
-    struct TermSize {
-        row: usize,
-        col: usize
+    pub struct TermSize {
+        row: c_short,
+        col: c_short,
     }
 
     #[link(name = "texteditor.a")]
@@ -184,14 +192,11 @@ mod terminal {
     type ColCount = usize;
     type RowCount = usize;
 
-    fn get_terminal_size() -> Option<(ColCount,RowCount)> {
+    pub fn get_terminal_size() -> Option<TermSize> {
         let mut size = TermSize::default();
-        match unsafe {
-            terminal_size(&mut size)
-        }  {
-            0 => Some((size.col,size.row)),
-            _ => None
+        match unsafe { terminal_size(&mut size) } {
+            0 => Some(size),
+            _ => None,
         }
     }
 }
-
