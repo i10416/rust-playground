@@ -6,19 +6,16 @@
 
 antirez's kilo を少し改変したテキストエディタをRustで書く.
 
-## Supported Features
-
  */
 
 use std::fmt::Debug;
-// user input -> stdin variable -> `program world`
 use std::io::{self, Read, Write};
-use std::os::raw::{c_char, c_short, c_uint};
+use std::os::raw::{c_char, c_uint};
 
 type Cflag = c_uint;
 type Speed = c_uint;
 const NCCS: usize = 32;
-// メモリレイアウトの最適化をしないようにする
+// prevent memory layout optimization
 #[repr(C)]
 pub struct Termios {
     c_iflag: Cflag,       /* input mode flags */
@@ -107,13 +104,14 @@ fn main() -> Result<(), ()> {
             unsafe {
                 restore(&state.termios);
             }
+            println!("{}", message);
             Ok(())
         }
         Err(_) => unimplemented!(),
     }
 }
-fn clean_display() -> () {
-    io::stdout().write(&"\x1b[2J\x1b[H".as_bytes()).unwrap();
+fn clean_display() -> String {
+    String::from("\x1b[2J\x1b[H")
 }
 
 fn build_row(content: &str) -> String {
@@ -128,33 +126,28 @@ fn render_screen(rows: Vec<String>) {
 }
 
 fn tick(state: State) -> Result<(String, State), String> {
-    clean_display();
+    let clean_cmd = clean_display();
     match io::stdin().bytes().next() {
-        Some(Ok(input)) if input == ('q' as u8) & 0x1f => Ok((String::from("Bye!"), state)),
+        Some(Ok(input)) if input == ('q' as u8) & 0x1f => Ok((clean_cmd + "Bye!", state)),
         Some(Ok(_)) => {
-            print!(
-                "{}",
-                build_screen(
-                    (0..state.size.row)
-                        .into_iter()
-                        .map(|_| { build_row(&format!("{:?}", state.size)) })
-                        .collect()
-                )
+            let textarea = build_screen(
+                (0..state.size.row)
+                    .into_iter()
+                    .map(|_| build_row(&format!("{:?}", state.size)))
+                    .collect(),
             );
             let (cmd, _) = terminal::Cursor::origin();
-            io::stdout().write(cmd.as_bytes()).unwrap();
+            io::stdout().write((clean_cmd + &textarea + &cmd).as_bytes()).unwrap();
             // disable buffer
             io::stdout().flush().expect("success");
             tick(state)
         }
         Some(Err(_)) => unimplemented!(),
         None => {
-            print!(
-                "{}",
-                build_screen((0..24).into_iter().map(|_| { build_row("") }).collect())
-            );
+            let textarea = build_screen((0..state.size.row).into_iter().map(|_| build_row("")).collect());
+
             let (cmd, _) = terminal::Cursor::origin();
-            io::stdout().write(cmd.as_bytes()).unwrap();
+            io::stdout().write((clean_cmd + &textarea + &cmd).as_bytes()).unwrap();
             io::stdout().flush().expect("success");
             tick(state)
         }
@@ -168,18 +161,47 @@ mod terminal {
     pub struct Cursor {
         row: usize,
         col: usize,
+        visibility: bool,
     }
 
     impl Cursor {
         pub fn origin() -> (String, Cursor) {
-            (String::from("\x1b[H"), Cursor { row: 0, col: 0 })
+            (
+                String::from("\x1b[H"),
+                Cursor {
+                    row: 0,
+                    col: 0,
+                    visibility: true,
+                },
+            )
         }
         pub fn move_by(&self, col: usize, row: usize) -> (String, Cursor) {
             let next = Cursor {
                 row: self.row + row,
                 col: self.col + col,
+                visibility: self.visibility,
             };
             (format!("\x1b[{}C\x1b[{}B", next.row, next.col), next)
+        }
+        pub fn hide(&self) -> (String, Cursor) {
+            (
+                format!("\x1b[?25l"),
+                Cursor {
+                    row: self.row,
+                    col: self.col,
+                    visibility: false,
+                },
+            )
+        }
+        pub fn show(&self) -> (String, Cursor) {
+            (
+                format!("\x1b[?25h"),
+                Cursor {
+                    row: self.row,
+                    col: self.col,
+                    visibility: true,
+                },
+            )
         }
     }
 
@@ -217,10 +239,7 @@ mod terminal {
 
         // query cursor position
         match io::stdout().write("\x1b[6n".as_bytes()) {
-            Ok(n) => {
-                println!("query: {}", n);
-                Ok(read_res().unwrap())
-            }
+            Ok(_) => Ok(read_res().unwrap()),
             Err(e) => Err(e),
         }
     }
@@ -237,8 +256,7 @@ mod terminal {
                 }
             })
             .flat_map(|c| c.map(|c| c as char))
-            .fold(String::new(), |mut acc, input| acc + &input.to_string());
-        println!("{:?}", result);
+            .fold(String::new(), |acc, input| acc + &input.to_string());
         result.strip_prefix("\x1b[").and_then(|s| {
             match s.split(";").map(|s| s.parse().unwrap()).collect::<Vec<i16>>()[..2] {
                 [row, col] => Some((row, col)),
