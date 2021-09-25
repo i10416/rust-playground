@@ -101,7 +101,7 @@ fn main() -> Result<(), ()> {
     let term_size = terminal::get_terminal_size().unwrap();
     let state = State::new(original, term_size);
 
-    match read_rec(state) {
+    match tick(state) {
         Ok((message, state)) => {
             clean_display();
             unsafe {
@@ -116,20 +116,6 @@ fn clean_display() -> () {
     io::stdout().write(&"\x1b[2J\x1b[H".as_bytes()).unwrap();
 }
 
-struct Cursor {
-    row: usize,
-    col: usize,
-}
-
-impl Cursor {
-    fn origin() -> (String, Cursor) {
-        (String::from("\x1b[H"), Cursor { row: 0, col: 0 })
-    }
-    fn move_by(&self, x: usize, y: usize) -> (String, Cursor) {
-        unimplemented!()
-    }
-}
-
 fn build_row(content: &str) -> String {
     String::from(format!("~ {}", content))
 }
@@ -141,7 +127,7 @@ fn render_screen(rows: Vec<String>) {
     rows.into_iter().zip((0..)).for_each(|(row, row_number)| {})
 }
 
-fn read_rec(state: State) -> Result<(String, State), String> {
+fn tick(state: State) -> Result<(String, State), String> {
     clean_display();
     match io::stdin().bytes().next() {
         Some(Ok(input)) if input == ('q' as u8) & 0x1f => Ok((String::from("Bye!"), state)),
@@ -149,17 +135,17 @@ fn read_rec(state: State) -> Result<(String, State), String> {
             print!(
                 "{}",
                 build_screen(
-                    (0..24)
+                    (0..state.size.row)
                         .into_iter()
                         .map(|_| { build_row(&format!("{:?}", state.size)) })
                         .collect()
                 )
             );
-            let (cmd, _) = Cursor::origin();
+            let (cmd, _) = terminal::Cursor::origin();
             io::stdout().write(cmd.as_bytes()).unwrap();
             // disable buffer
             io::stdout().flush().expect("success");
-            read_rec(state)
+            tick(state)
         }
         Some(Err(_)) => unimplemented!(),
         None => {
@@ -167,22 +153,41 @@ fn read_rec(state: State) -> Result<(String, State), String> {
                 "{}",
                 build_screen((0..24).into_iter().map(|_| { build_row("") }).collect())
             );
-            let (cmd, _) = Cursor::origin();
+            let (cmd, _) = terminal::Cursor::origin();
             io::stdout().write(cmd.as_bytes()).unwrap();
             io::stdout().flush().expect("success");
-            read_rec(state)
+            tick(state)
         }
     }
 }
 
 mod terminal {
+    use std::io::{self, Read, Write};
     use std::os::raw::c_short;
+
+    pub struct Cursor {
+        row: usize,
+        col: usize,
+    }
+
+    impl Cursor {
+        pub fn origin() -> (String, Cursor) {
+            (String::from("\x1b[H"), Cursor { row: 0, col: 0 })
+        }
+        pub fn move_by(&self, col: usize, row: usize) -> (String, Cursor) {
+            let next = Cursor {
+                row: self.row + row,
+                col: self.col + col,
+            };
+            (format!("\x1b[{}C\x1b[{}B", next.row, next.col), next)
+        }
+    }
 
     #[derive(Default, Debug)]
     #[repr(C)]
     pub struct TermSize {
-        row: c_short,
-        col: c_short,
+        pub row: c_short,
+        pub col: c_short,
     }
 
     #[link(name = "texteditor.a")]
@@ -192,11 +197,53 @@ mod terminal {
     type ColCount = usize;
     type RowCount = usize;
 
+    // TODO(i10416): https://viewsourcecode.org/snaptoken/kilo/03.rawInputAndOutput.html#window-size-the-hard-way
+
     pub fn get_terminal_size() -> Option<TermSize> {
         let mut size = TermSize::default();
         match unsafe { terminal_size(&mut size) } {
             0 => Some(size),
-            _ => None,
+            _ => match get_term_size_fallback() {
+                Ok((row, col)) => Some(TermSize { row: row, col: col }),
+                Err(_) => None,
+            },
         }
+    }
+
+    pub fn get_term_size_fallback() -> Result<(i16, i16), std::io::Error> {
+        let (cmd, _) = Cursor::origin().1.move_by(999, 999);
+        // attempt to move cursor at right bottom
+        io::stdout().write(cmd.as_bytes())?;
+
+        // query cursor position
+        match io::stdout().write("\x1b[6n".as_bytes()) {
+            Ok(n) => {
+                println!("query: {}", n);
+                Ok(read_res().unwrap())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn read_res() -> Option<(i16, i16)> {
+        let result = io::stdin()
+            .bytes()
+            .take_while(|res| match res {
+                Ok(u) if u == &b'R' => false,
+                Ok(_) => true,
+                Err(_) => {
+                    println!("something went wrong");
+                    false
+                }
+            })
+            .flat_map(|c| c.map(|c| c as char))
+            .fold(String::new(), |mut acc, input| acc + &input.to_string());
+        println!("{:?}", result);
+        result.strip_prefix("\x1b[").and_then(|s| {
+            match s.split(";").map(|s| s.parse().unwrap()).collect::<Vec<i16>>()[..2] {
+                [row, col] => Some((row, col)),
+                _ => None,
+            }
+        })
     }
 }
