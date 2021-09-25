@@ -147,21 +147,72 @@ fn build_welcome_message(col_count: u16, row_number: usize) -> String {
     }
 }
 
+fn key_to_move(c: u8) -> (i32, i32) {
+    match c as char {
+        'k' => (0, -1),
+        'j' => (0, 1),
+        'h' => (-1, 0),
+        'l' => (1, 0),
+        _ => (0, 0),
+    }
+}
+
+fn arrow_key_to_move(c: u8) -> (i32, i32) {
+    match c as char {
+        'A' => (0, -1),
+        'B' => (0, 1),
+        'C' => (1, 0),
+        'D' => (-1, 0),
+        _ => (0, 0),
+    }
+}
+
 fn tick(state: State) -> Result<(String, State), String> {
     let (hide_cursor_cmd, cursor) = state.cursor.hide();
+    let render_textarea_cmd = build_screen(
+        (0..state.size.row)
+            .into_iter()
+            .zip(0..)
+            .map(|(row, idx)| build_row("", idx))
+            .collect(),
+    );
     match io::stdin().bytes().next() {
-        Some(Ok(input)) if input == ('q' as u8) & 0x1f => Ok((clean_display() + "Bye!", state)),
-        Some(Ok(_)) => {
-            let textarea = build_screen(
-                (0..state.size.row)
-                    .into_iter()
-                    .zip(0..)
-                    .map(|(row, idx)| build_row("", idx))
-                    .collect(),
-            );
+        Some(Ok(input)) if input == b'q' & 0x1f => Ok((cursor.move_to(0, 0).0 + &clean_display() + "Bye!", state)),
+        // handle \x1b[A,\x1b[B,\x1b[C,\x1b[D
+        Some(Ok(b'\x1b')) => {
+            match io::stdin().bytes().peekable().peek() {
+                Some(Ok(u)) if u == &b'[' => match io::stdin().bytes().next() {
+                    Some(Ok(input)) => {
+                        let (dx, dy) = arrow_key_to_move(input);
+                        let (move_cmd, cursor) = cursor.move_by(dx, dy);
+                        let (show_cursor_cmd, cursor) = cursor.show();
+                        io::stdout()
+                            .write((hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd).as_bytes())
+                            .unwrap();
+                        // disable buffer
+                        io::stdout().flush().expect("success");
+                        tick(State {
+                            size: state.size,
+                            cursor: cursor,
+                            termios: state.termios,
+                        })
+                    }
+                    other => {
+                        println!("{:?}", other);
+                        unimplemented!()
+                    }
+                },
+                Some(Ok(u)) => unimplemented!(),
+                Some(Err(_)) => unimplemented!(),
+                None => unimplemented!(),
+            }
+        }
+        Some(Ok(input)) => {
+            let (dx, dy) = key_to_move(input);
+            let (move_cmd, cursor) = cursor.move_by(dx, dy);
             let (show_cursor_cmd, cursor) = cursor.show();
             io::stdout()
-                .write((hide_cursor_cmd + &textarea + &show_cursor_cmd).as_bytes())
+                .write((hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd).as_bytes())
                 .unwrap();
             // disable buffer
             io::stdout().flush().expect("success");
@@ -222,18 +273,18 @@ mod terminal {
                 },
             )
         }
-        pub fn move_by(&self, col: usize, row: usize) -> (String, Cursor) {
+        pub fn move_by(&self, col: i32, row: i32) -> (String, Cursor) {
             let next = Cursor {
-                row: self.row + row,
-                col: self.col + col,
+                row: std::cmp::max(self.row as i32 + row, 0) as usize,
+                col: std::cmp::max(self.col as i32 + col, 0) as usize,
                 visibility: self.visibility,
             };
-            (format!("\x1b[{}C\x1b[{}B", next.row, next.col), next)
+            (format!("\x1b[{}C\x1b[{}B", next.col, next.row), next)
         }
 
         pub fn move_to(&self, col: usize, row: usize) -> (String, Cursor) {
             let (origin_cmd, cursor) = Cursor::origin();
-            let (move_cmd, cursor) = cursor.move_by(col, row);
+            let (move_cmd, cursor) = cursor.move_by(col as i32, row as i32);
             (origin_cmd + &move_cmd, cursor)
         }
 
@@ -248,13 +299,12 @@ mod terminal {
             )
         }
         pub fn show(&self) -> (String, Cursor) {
+            let (cmd, cursor) = self.move_to(self.col, self.row);
             (
-                // cursor.visibility = true
-                // todo: cursor.position
-                format!("\x1b[?25h"),
+                cmd + &format!("\x1b[?25h"),
                 Cursor {
-                    row: self.row,
-                    col: self.col,
+                    col: cursor.col,
+                    row: cursor.row,
                     visibility: true,
                 },
             )
