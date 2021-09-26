@@ -103,6 +103,10 @@ fn main() -> Result<(), ()> {
     .unwrap();
     let term_size = terminal::get_terminal_size().unwrap();
     let (_, cursor) = terminal::Cursor::origin();
+    io::stdout()
+        .write(clean_display().as_bytes())
+        .and_then(|_| io::stdout().flush())
+        .expect("success");
     let state = State::new(original, term_size, cursor);
 
     match tick(state) {
@@ -122,14 +126,18 @@ fn clean_display() -> String {
 }
 
 fn build_row(content: &str, idx: usize) -> String {
-    String::from(format!("~{}:{} {}", idx, clean_line(), content))
+    format!("~{}:{} {}", idx, content, clean_line())
 }
 fn build_screen(rows: Vec<String>) -> String {
-    rows.into_iter().fold(String::new(), |acc, s| acc + &s + "\r\n")
+    let last = rows.len();
+    let cleaner = clean_line();
+    rows.into_iter().zip(1..).fold(String::new(), |acc, (s, i)| {
+        acc + &s + &(if i == last { "" } else { "\r\n" })
+    })
 }
 // todo: render_screen(previous_state,reducer)
 fn render_screen(rows: Vec<String>) {
-    rows.into_iter().zip((0..)).for_each(|(row, row_number)| {})
+    rows.into_iter().zip(1..).for_each(|(row, row_number)| {})
 }
 fn clean_line() -> String {
     String::from("\x1b[K")
@@ -137,12 +145,13 @@ fn clean_line() -> String {
 
 fn build_welcome_message(col_count: u16, row_number: usize) -> String {
     match format!("Kilo Editor -- version {}", KILO_VERSION) {
-        s if s.len() > col_count.into() => s[..col_count.into()].to_string(),
+        s if s.len() > col_count.into() => s[..col_count.into()].to_string() + &clean_line(),
         s => {
             format!("~{}:", row_number)
-                + &" ".repeat((col_count as usize) / 2 - s.len() / 2 - 2)
+                + &" ".repeat((col_count as usize) / 2 - s.len() / 2 - 3)
                 + &s
                 + &" ".repeat((col_count as usize) / 2 - s.len() / 2)
+                + &clean_line()
         }
     }
 }
@@ -169,10 +178,11 @@ fn arrow_key_to_move(c: u8) -> (i32, i32) {
 
 fn tick(state: State) -> Result<(String, State), String> {
     let (hide_cursor_cmd, cursor) = state.cursor.hide();
+    let (set_cursor_cmd, _) = cursor.move_to(0, 0);
     let render_textarea_cmd = build_screen(
         (0..state.size.row)
             .into_iter()
-            .zip(0..)
+            .zip(1..)
             .map(|(row, idx)| build_row("", idx))
             .collect(),
     );
@@ -184,10 +194,13 @@ fn tick(state: State) -> Result<(String, State), String> {
                 Some(Ok(u)) if u == &b'[' => match io::stdin().bytes().next() {
                     Some(Ok(input)) => {
                         let (dx, dy) = arrow_key_to_move(input);
-                        let (move_cmd, cursor) = cursor.move_by(dx, dy);
+                        let (_, cursor) = cursor.move_by(dx, dy);
                         let (show_cursor_cmd, cursor) = cursor.show();
                         io::stdout()
-                            .write((hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd).as_bytes())
+                            .write(
+                                (hide_cursor_cmd + &set_cursor_cmd + &render_textarea_cmd + &show_cursor_cmd)
+                                    .as_bytes(),
+                            )
                             .unwrap();
                         // disable buffer
                         io::stdout().flush().expect("success");
@@ -197,22 +210,21 @@ fn tick(state: State) -> Result<(String, State), String> {
                             termios: state.termios,
                         })
                     }
-                    other => {
-                        println!("{:?}", other);
+                    _ => {
                         unimplemented!()
                     }
                 },
-                Some(Ok(u)) => unimplemented!(),
+                Some(Ok(_)) => unimplemented!(),
                 Some(Err(_)) => unimplemented!(),
                 None => unimplemented!(),
             }
         }
         Some(Ok(input)) => {
             let (dx, dy) = key_to_move(input);
-            let (move_cmd, cursor) = cursor.move_by(dx, dy);
+            let (_, cursor) = cursor.move_by(dx, dy);
             let (show_cursor_cmd, cursor) = cursor.show();
             io::stdout()
-                .write((hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd).as_bytes())
+                .write((hide_cursor_cmd + &set_cursor_cmd + &render_textarea_cmd + &show_cursor_cmd).as_bytes())
                 .unwrap();
             // disable buffer
             io::stdout().flush().expect("success");
@@ -228,9 +240,9 @@ fn tick(state: State) -> Result<(String, State), String> {
                 (0..state.size.row)
                     .into_iter()
                     .into_iter()
-                    .zip(0..)
-                    .map(|(row, idx)| {
-                        if row == state.size.row / 3 {
+                    .zip(1..)
+                    .map(|(_, idx)| {
+                        if idx == 6 {
                             build_welcome_message(state.size.col, idx)
                         } else {
                             build_row("", idx)
@@ -240,7 +252,9 @@ fn tick(state: State) -> Result<(String, State), String> {
             );
 
             let (show_cursor_cmd, cursor) = cursor.show();
-            io::stdout().write((textarea + &show_cursor_cmd).as_bytes()).unwrap();
+            io::stdout()
+                .write((hide_cursor_cmd + &set_cursor_cmd + &textarea + &show_cursor_cmd).as_bytes())
+                .unwrap();
             io::stdout().flush().expect("success");
             tick(State {
                 size: state.size,
@@ -274,18 +288,26 @@ mod terminal {
             )
         }
         pub fn move_by(&self, col: i32, row: i32) -> (String, Cursor) {
-            let next = Cursor {
+            self.move_to(
+                std::cmp::max(self.col as i32 + col, 0) as usize,
+                std::cmp::max(self.row as i32 + row, 0) as usize,
+            )
+            /*let next = Cursor {
                 row: std::cmp::max(self.row as i32 + row, 0) as usize,
                 col: std::cmp::max(self.col as i32 + col, 0) as usize,
                 visibility: self.visibility,
-            };
-            (format!("\x1b[{}C\x1b[{}B", next.col, next.row), next)
+            };*/
+            //(format!("\x1b[{}C\x1b[{}B", next.col, next.row), next)
         }
 
         pub fn move_to(&self, col: usize, row: usize) -> (String, Cursor) {
-            let (origin_cmd, cursor) = Cursor::origin();
-            let (move_cmd, cursor) = cursor.move_by(col as i32, row as i32);
-            (origin_cmd + &move_cmd, cursor)
+            let next = Cursor {
+                row: row,
+                col: col,
+                visibility: self.visibility,
+            };
+            let cmd = format!("\x1b[{};{}H", next.row, next.col);
+            (cmd, next)
         }
 
         pub fn hide(&self) -> (String, Cursor) {
