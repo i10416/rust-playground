@@ -188,11 +188,12 @@ fn tick(state: State) -> Result<(String, State), String> {
     );
     match io::stdin().bytes().next() {
         Some(Ok(input)) if input == b'q' & 0x1f => Ok((cursor.move_to(0, 0).0 + &clean_display() + "Bye!", state)),
+        // todo: ネストが深くてつらいのであり得ないケースは unwrap,expect などで雑にハンドリングする
         // handle \x1b[A,\x1b[B,\x1b[C,\x1b[D
         Some(Ok(b'\x1b')) => {
             match io::stdin().bytes().peekable().peek() {
                 Some(Ok(u)) if u == &b'[' => match io::stdin().bytes().next() {
-                    Some(Ok(input @ (b'k' | b'j' | b'l' | b'h'))) => {
+                    Some(Ok(input @ (b'A' | b'B' | b'C' | b'D'))) => {
                         let (dx, dy) = arrow_key_to_move(input);
                         let (_, cursor) = cursor.move_by(dx, dy);
                         let (show_cursor_cmd, cursor) = cursor.show();
