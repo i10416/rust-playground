@@ -192,7 +192,7 @@ fn tick(state: State) -> Result<(String, State), String> {
         Some(Ok(b'\x1b')) => {
             match io::stdin().bytes().peekable().peek() {
                 Some(Ok(u)) if u == &b'[' => match io::stdin().bytes().next() {
-                    Some(Ok(input)) => {
+                    Some(Ok(input @ (b'k' | b'j' | b'l' | b'h'))) => {
                         let (dx, dy) = arrow_key_to_move(input);
                         let (_, cursor) = cursor.move_by(dx, dy);
                         let (show_cursor_cmd, cursor) = cursor.show();
@@ -209,6 +209,27 @@ fn tick(state: State) -> Result<(String, State), String> {
                             cursor: cursor,
                             termios: state.termios,
                         })
+                    }
+                    Some(Ok(b'3')) => {
+                        match io::stdin().bytes().peekable().peek() {
+                            Some(Ok(b'~')) => {
+                                let (show_cursor_cmd, cursor) = cursor.show();
+                                io::stdout()
+                                    .write(
+                                        (hide_cursor_cmd + &set_cursor_cmd + &render_textarea_cmd + &show_cursor_cmd)
+                                            .as_bytes(),
+                                    )
+                                    .unwrap();
+                                // disable buffer
+                                io::stdout().flush().expect("success");
+                                tick(State {
+                                    size: state.size,
+                                    cursor: cursor,
+                                    termios: state.termios,
+                                })
+                            }
+                            _ => unimplemented!(),
+                        }
                     }
                     _ => {
                         unimplemented!()
