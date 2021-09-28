@@ -18,6 +18,7 @@ const NCCS: usize = 32;
 const KILO_VERSION: &str = "0.0.0";
 // prevent memory layout optimization
 #[repr(C)]
+#[derive(Debug,Default)]
 pub struct Termios {
     c_iflag: Cflag,       /* input mode flags */
     c_oflag: Cflag,       /* output mode flags */
@@ -29,20 +30,6 @@ pub struct Termios {
     c_ospeed: Speed,
 }
 
-impl Debug for Termios {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Termios")
-            .field("c_iflag", &self.c_iflag)
-            .field("c_oflag", &self.c_oflag)
-            .field("c_cflag", &self.c_cflag)
-            .field("c_lflag", &self.c_lflag)
-            .field("c_line", &self.c_line)
-            .field("c_cc", &self.c_cc)
-            .field("c_ispeed", &self.c_ispeed)
-            .field("c_ospeed", &self.c_ospeed)
-            .finish()
-    }
-}
 impl std::fmt::Display for Termios {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -53,20 +40,6 @@ impl std::fmt::Display for Termios {
     }
 }
 
-impl Default for Termios {
-    fn default() -> Self {
-        Self {
-            c_iflag: Default::default(),
-            c_oflag: Default::default(),
-            c_cflag: Default::default(),
-            c_lflag: Default::default(),
-            c_line: Default::default(),
-            c_cc: Default::default(),
-            c_ispeed: Default::default(),
-            c_ospeed: Default::default(),
-        }
-    }
-}
 
 #[link(name = "texteditor.a")]
 extern "C" {
@@ -130,7 +103,6 @@ fn build_row(content: &str, idx: usize) -> String {
 }
 fn build_screen(rows: Vec<String>) -> String {
     let last = rows.len();
-    let cleaner = clean_line();
     rows.into_iter().zip(1..).fold(String::new(), |acc, (s, i)| {
         acc + &s + &(if i == last { "" } else { "\r\n" })
     })
@@ -192,7 +164,7 @@ fn tick(state: State) -> Result<(String, State), String> {
         // handle \x1b[A,\x1b[B,\x1b[C,\x1b[D
         Some(Ok(b'\x1b')) => {
             match io::stdin().bytes().peekable().peek() {
-                Some(Ok(u)) if u == &b'[' => match io::stdin().bytes().next() {
+                Some(Ok(b'[')) => match io::stdin().bytes().next() {
                     Some(Ok(input @ (b'A' | b'B' | b'C' | b'D'))) => {
                         let (dx, dy) = arrow_key_to_move(input);
                         let (_, cursor) = cursor.move_by(dx, dy);
@@ -297,7 +269,7 @@ mod terminal {
         col: usize,
         visibility: bool,
     }
-
+    // todo: handle terminal size bounds
     impl Cursor {
         pub fn origin() -> (String, Cursor) {
             (
@@ -314,12 +286,6 @@ mod terminal {
                 std::cmp::max(self.col as i32 + col, 0) as usize,
                 std::cmp::max(self.row as i32 + row, 0) as usize,
             )
-            /*let next = Cursor {
-                row: std::cmp::max(self.row as i32 + row, 0) as usize,
-                col: std::cmp::max(self.col as i32 + col, 0) as usize,
-                visibility: self.visibility,
-            };*/
-            //(format!("\x1b[{}C\x1b[{}B", next.col, next.row), next)
         }
 
         pub fn move_to(&self, col: usize, row: usize) -> (String, Cursor) {
