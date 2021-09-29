@@ -30,6 +30,44 @@ pub struct Termios {
     c_ispeed: Speed,      /* input speed */
     c_ospeed: Speed,
 }
+#[derive(Debug)]
+struct Viewport {
+    // offset: (col,row)
+    offset: (usize, usize),
+    //  size: (col,row)
+    size: (usize, usize),
+    max_height: usize,
+}
+
+impl Viewport {
+    pub fn update_with(&self, cursor: &terminal::Cursor) -> Viewport {
+        let next_offset = match (cursor.col, cursor.row) {
+            (col, row) if row > self.offset.1 + self.size.1 && col > self.offset.0 + self.size.0 => {
+                (col - self.size.0, row - self.size.1)
+            }
+            (_, row) if row > self.offset.1 + self.size.1 => (self.offset.0, row - self.size.1),
+            (_, row) if row < self.offset.1 => (self.offset.0, row),
+            (col, _) if col > self.offset.0 + self.size.0 => (col - self.size.0, self.offset.1),
+            (col, _) if col < self.offset.0 => (col, self.offset.1),
+            _ => self.offset,
+        };
+        Viewport {
+            offset: next_offset,
+            size: self.size,
+            max_height: self.max_height,
+        }
+    }
+
+    pub fn contains(&self, cursor: &terminal::Cursor) -> bool {
+        match (cursor.col, cursor.row) {
+            (col, _) if col > self.offset.0 + self.size.0 => false,
+            (col, _) if col < self.offset.0 => false,
+            (_, row) if row > self.offset.1 + self.size.1 => false,
+            (_, row) if row < self.offset.1 => false,
+            _ => true,
+        }
+    }
+}
 
 impl std::fmt::Display for Termios {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -55,15 +93,23 @@ struct State {
     cursor: terminal::Cursor,
     size: terminal::TermSize,
     rows: Vec<String>,
+    viewport: Viewport, //: Viewport{rows:rows,offset:(top,left)}
 }
 
 impl State {
-    fn new(t: Termios, size: terminal::TermSize, cursor: terminal::Cursor, rows: Vec<String>) -> State {
+    fn new(
+        t: Termios,
+        size: terminal::TermSize,
+        cursor: terminal::Cursor,
+        rows: Vec<String>,
+        viewport: Viewport,
+    ) -> State {
         State {
             termios: t,
             size: size,
             cursor: cursor,
             rows: rows,
+            viewport: viewport,
         }
     }
 }
@@ -85,7 +131,12 @@ fn main() -> Result<(), ()> {
         .write(clean_display().as_bytes())
         .and_then(|_| io::stdout().flush())
         .expect("success");
-    let state = State::new(original, term_size, cursor, rows);
+    let viewport = Viewport {
+        offset: (0, 0),
+        size: (term_size.col.into(), term_size.row.into()),
+        max_height: rows.len() - 1,
+    };
+    let state = State::new(original, term_size, cursor, rows, viewport);
 
     match tick(state) {
         Ok((message, state)) => {
@@ -136,7 +187,7 @@ fn clean_line() -> String {
 }
 
 fn build_welcome_message(col_count: u16, row_number: usize) -> String {
-    match format!("Kilo Editor -- version {}", KILO_VERSION) {
+    match format!("Rusty Editor -- version {}", KILO_VERSION) {
         s if s.len() > col_count.into() => s[..col_count.into()].to_string() + &clean_line(),
         s => {
             format!("~{}:", row_number)
@@ -170,15 +221,15 @@ fn arrow_key_to_move(c: u8) -> (i32, i32) {
 
 fn tick(state: State) -> Result<(String, State), String> {
     let (hide_cursor_cmd, cursor) = state.cursor.hide();
-    let (set_cursor_cmd, _) = cursor.move_to(0, 0);
+    let (set_cursor_cmd, _) = cursor.move_to(0, 0); // cursor.move_to(viewport.offset);
     let render_textarea_cmd = build_screen(
         state
             .rows
             .clone()
             .into_iter()
-            //.skip(offset)
+            .skip(state.viewport.offset.1)
             .take(state.size.row.into())
-            .zip(1..)
+            .zip((state.viewport.offset.1 + 1)..)
             .map(|(row, idx)| build_row(&row, idx))
             .collect(),
     );
@@ -191,7 +242,13 @@ fn tick(state: State) -> Result<(String, State), String> {
                 Some(Ok(b'[')) => match io::stdin().bytes().next() {
                     Some(Ok(input @ (b'A' | b'B' | b'C' | b'D'))) => {
                         let (dx, dy) = arrow_key_to_move(input);
+                        // let cursor_bounds = (left,top,right,bottom) = (0,0,rows(cursor.row).length-1,state.rows.length);
                         let (_, cursor) = cursor.move_by(dx, dy);
+                        let viewport = if state.viewport.contains(&cursor) {
+                            state.viewport
+                        } else {
+                            state.viewport.update_with(&cursor)
+                        };
                         let (show_cursor_cmd, cursor) = cursor.show();
                         io::stdout()
                             .write(
@@ -206,6 +263,7 @@ fn tick(state: State) -> Result<(String, State), String> {
                             cursor: cursor,
                             termios: state.termios,
                             rows: state.rows,
+                            viewport: viewport,
                         })
                     }
                     // handle delete key
@@ -226,6 +284,7 @@ fn tick(state: State) -> Result<(String, State), String> {
                                     cursor: cursor,
                                     termios: state.termios,
                                     rows: state.rows,
+                                    viewport: state.viewport,
                                 })
                             }
                             _ => unimplemented!(),
@@ -243,6 +302,11 @@ fn tick(state: State) -> Result<(String, State), String> {
         Some(Ok(input)) => {
             let (dx, dy) = key_to_move(input);
             let (_, cursor) = cursor.move_by(dx, dy);
+            let viewport = if state.viewport.contains(&cursor) {
+                state.viewport
+            } else {
+                state.viewport.update_with(&cursor)
+            };
             let (show_cursor_cmd, cursor) = cursor.show();
             io::stdout()
                 .write((hide_cursor_cmd + &set_cursor_cmd + &render_textarea_cmd + &show_cursor_cmd).as_bytes())
@@ -254,6 +318,7 @@ fn tick(state: State) -> Result<(String, State), String> {
                 cursor: cursor,
                 termios: state.termios,
                 rows: state.rows,
+                viewport: viewport,
             })
         }
         Some(Err(_)) => unimplemented!(),
@@ -268,6 +333,7 @@ fn tick(state: State) -> Result<(String, State), String> {
                 cursor: cursor,
                 termios: state.termios,
                 rows: state.rows,
+                viewport: state.viewport,
             })
         }
     }
@@ -279,9 +345,9 @@ mod terminal {
 
     #[derive(Debug)]
     pub struct Cursor {
-        row: usize,
-        col: usize,
-        visibility: bool,
+        pub row: usize,
+        pub col: usize,
+        pub visibility: bool,
     }
     // todo: handle terminal size bounds
     impl Cursor {
@@ -295,14 +361,14 @@ mod terminal {
                 },
             )
         }
-        pub fn move_by(&self, col: i32, row: i32) -> (String, Cursor) {
+        pub fn move_by(&self, col: i32, row: i32 /* bounds:(left,top,right,bottom) */) -> (String, Cursor) {
             self.move_to(
                 std::cmp::max(self.col as i32 + col, 0) as usize,
                 std::cmp::max(self.row as i32 + row, 0) as usize,
             )
         }
 
-        pub fn move_to(&self, col: usize, row: usize) -> (String, Cursor) {
+        pub fn move_to(&self, col: usize, row: usize /* bounds:(left,top,right,bottom) */) -> (String, Cursor) {
             let next = Cursor {
                 row: row,
                 col: col,
