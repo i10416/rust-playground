@@ -8,8 +8,9 @@ antirez's kilo を少し改変したテキストエディタをRustで書く.
 
  */
 
+// todo: handle viewport offset
 use std::fmt::Debug;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::os::raw::{c_char, c_uint};
 
 type Cflag = c_uint;
@@ -18,7 +19,7 @@ const NCCS: usize = 32;
 const KILO_VERSION: &str = "0.0.0";
 // prevent memory layout optimization
 #[repr(C)]
-#[derive(Debug,Default)]
+#[derive(Debug, Default)]
 pub struct Termios {
     c_iflag: Cflag,       /* input mode flags */
     c_oflag: Cflag,       /* output mode flags */
@@ -40,26 +41,29 @@ impl std::fmt::Display for Termios {
     }
 }
 
-
 #[link(name = "texteditor.a")]
 extern "C" {
     fn enable_raw_mode(original: *mut Termios) -> i32;
     fn restore(original: *const Termios) -> i32;
 }
-
+/**
+* represent app state
+*/
 #[derive(Debug)]
 struct State {
     termios: Termios,
     cursor: terminal::Cursor,
     size: terminal::TermSize,
+    rows: Vec<String>,
 }
 
 impl State {
-    fn new(t: Termios, size: terminal::TermSize, cursor: terminal::Cursor) -> State {
+    fn new(t: Termios, size: terminal::TermSize, cursor: terminal::Cursor, rows: Vec<String>) -> State {
         State {
             termios: t,
             size: size,
             cursor: cursor,
+            rows: rows,
         }
     }
 }
@@ -76,11 +80,12 @@ fn main() -> Result<(), ()> {
     .unwrap();
     let term_size = terminal::get_terminal_size().unwrap();
     let (_, cursor) = terminal::Cursor::origin();
+    let rows = read_file("README.md").unwrap_or(vec![build_welcome_message(term_size.col, 1)]);
     io::stdout()
         .write(clean_display().as_bytes())
         .and_then(|_| io::stdout().flush())
         .expect("success");
-    let state = State::new(original, term_size, cursor);
+    let state = State::new(original, term_size, cursor, rows);
 
     match tick(state) {
         Ok((message, state)) => {
@@ -96,6 +101,21 @@ fn main() -> Result<(), ()> {
 }
 fn clean_display() -> String {
     String::from("\x1b[2J")
+}
+
+fn read_file(file_path: &str) -> Result<Vec<String>, std::io::Error> {
+    let f = std::fs::File::open(file_path);
+    match f {
+        Ok(file) => Ok(std::io::BufReader::new(file)
+            .lines()
+            .into_iter()
+            .map(|result| result.unwrap_or(String::from("<err>")))
+            .fold(vec![], |mut acc, line| {
+                acc.push(line);
+                acc
+            })),
+        Err(e) => Err(e),
+    }
 }
 
 fn build_row(content: &str, idx: usize) -> String {
@@ -152,16 +172,20 @@ fn tick(state: State) -> Result<(String, State), String> {
     let (hide_cursor_cmd, cursor) = state.cursor.hide();
     let (set_cursor_cmd, _) = cursor.move_to(0, 0);
     let render_textarea_cmd = build_screen(
-        (0..state.size.row)
+        state
+            .rows
+            .clone()
             .into_iter()
+            //.skip(offset)
+            .take(state.size.row.into())
             .zip(1..)
-            .map(|(row, idx)| build_row("", idx))
+            .map(|(row, idx)| build_row(&row, idx))
             .collect(),
     );
     match io::stdin().bytes().next() {
         Some(Ok(input)) if input == b'q' & 0x1f => Ok((cursor.move_to(0, 0).0 + &clean_display() + "Bye!", state)),
         // todo: ネストが深くてつらいのであり得ないケースは unwrap,expect などで雑にハンドリングする
-        // handle \x1b[A,\x1b[B,\x1b[C,\x1b[D
+        // handle arrow keys(\x1b[A,\x1b[B,\x1b[C,\x1b[D)
         Some(Ok(b'\x1b')) => {
             match io::stdin().bytes().peekable().peek() {
                 Some(Ok(b'[')) => match io::stdin().bytes().next() {
@@ -181,8 +205,10 @@ fn tick(state: State) -> Result<(String, State), String> {
                             size: state.size,
                             cursor: cursor,
                             termios: state.termios,
+                            rows: state.rows,
                         })
                     }
+                    // handle delete key
                     Some(Ok(b'3')) => {
                         match io::stdin().bytes().peekable().peek() {
                             Some(Ok(b'~')) => {
@@ -199,6 +225,7 @@ fn tick(state: State) -> Result<(String, State), String> {
                                     size: state.size,
                                     cursor: cursor,
                                     termios: state.termios,
+                                    rows: state.rows,
                                 })
                             }
                             _ => unimplemented!(),
@@ -226,34 +253,21 @@ fn tick(state: State) -> Result<(String, State), String> {
                 size: state.size,
                 cursor: cursor,
                 termios: state.termios,
+                rows: state.rows,
             })
         }
         Some(Err(_)) => unimplemented!(),
         None => {
-            let textarea = build_screen(
-                (0..state.size.row)
-                    .into_iter()
-                    .into_iter()
-                    .zip(1..)
-                    .map(|(_, idx)| {
-                        if idx == 6 {
-                            build_welcome_message(state.size.col, idx)
-                        } else {
-                            build_row("", idx)
-                        }
-                    })
-                    .collect(),
-            );
-
             let (show_cursor_cmd, cursor) = cursor.show();
             io::stdout()
-                .write((hide_cursor_cmd + &set_cursor_cmd + &textarea + &show_cursor_cmd).as_bytes())
+                .write((hide_cursor_cmd + &set_cursor_cmd + &render_textarea_cmd + &show_cursor_cmd).as_bytes())
                 .unwrap();
             io::stdout().flush().expect("success");
             tick(State {
                 size: state.size,
                 cursor: cursor,
                 termios: state.termios,
+                rows: state.rows,
             })
         }
     }
