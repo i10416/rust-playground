@@ -82,30 +82,74 @@ extern "C" {
 * represent app state
 */
 #[derive(Debug)]
-struct State {
+struct State<'a> {
     termios: Termios,
     cursor: terminal::Cursor,
     size: terminal::TermSize,
     rows: Vec<String>,
     viewport: Viewport,
+    statusbar: StatusBar<'a>,
 }
 
-impl State {
+impl<'a> State<'a> {
     fn new(
         t: Termios,
         size: terminal::TermSize,
         cursor: terminal::Cursor,
         rows: Vec<String>,
         viewport: Viewport,
-    ) -> State {
+        statusbar: StatusBar<'a>,
+    ) -> State<'a> {
         State {
             termios: t,
-            size: size,
+            size,
             cursor: cursor,
             rows: rows,
             viewport: viewport,
+            statusbar: statusbar,
         }
     }
+}
+#[derive(Debug)]
+struct StatusBar<'a> {
+    lines: usize,
+    filename: Option<&'a str>,
+    filetype: Option<&'a str>,
+    has_change: bool,
+    width: usize,
+}
+impl<'a> StatusBar<'a> {
+    pub fn render(&self) -> String {
+        let truncated_filename = self
+            .filename
+            .map(|s| {
+                if s.len() >= self.width - 6 {
+                    s.get(0..self.width - 7).unwrap()
+                } else {
+                    s
+                }
+            })
+            .unwrap_or("[No Name]");
+        format!(
+            "\x1b[7m{}{}{} lines\x1b[m",
+            truncated_filename,
+            " ".repeat(self.width - 6 - truncated_filename.len() - self.lines.to_string().len()),
+            self.lines
+        )
+    }
+}
+
+fn replace_tabs(line: String) -> String {
+    line.chars()
+        .zip(0..)
+        .map(|(c, idx)| {
+            if c == '\t' {
+                " ".repeat(TAB_SIZE - (idx % TAB_SIZE))
+            } else {
+                c.to_string()
+            }
+        })
+        .collect::<String>()
 }
 
 fn main() -> Result<(), ()> {
@@ -122,18 +166,7 @@ fn main() -> Result<(), ()> {
     let rows: Vec<String> = read_file("README.md")
         .unwrap_or(vec![build_welcome_message(term_size.col, 1)])
         .into_iter()
-        .map(|row| {
-            row.chars()
-                .zip(0..)
-                .map(|(c, idx)| {
-                    if c == '\t' {
-                        " ".repeat(TAB_SIZE - (idx % TAB_SIZE))
-                    } else {
-                        c.to_string()
-                    }
-                })
-                .collect::<String>()
-        })
+        .map(|row| replace_tabs(row))
         .collect();
     let (_, cursor) = terminal::Cursor::origin(rows.first().map_or(0, |s| s.len()), rows.len() - 1);
     io::stdout()
@@ -142,10 +175,17 @@ fn main() -> Result<(), ()> {
         .expect("success");
     let viewport = Viewport {
         offset: (0, 0),
-        size: (term_size.col.into(), term_size.row.into()),
+        size: (term_size.col.into(), (term_size.row - 1).into()),
         max_height: rows.len() - 1,
     };
-    let state = State::new(original, term_size, cursor, rows, viewport);
+    let statusbar = StatusBar {
+        lines: rows.len(),
+        filename: None,
+        filetype: None,
+        has_change: false,
+        width: term_size.col.into(),
+    };
+    let state = State::new(original, term_size, cursor, rows, viewport, statusbar);
 
     match tick(state) {
         Ok((message, state)) => {
@@ -186,15 +226,15 @@ fn build_row(content: &str, idx: usize) -> String {
     format!("~{}:{} {}", idx, content, clean_line())
 }
 
-fn build_screen(rows: Vec<String>, offset: usize, height: usize) -> String {
-    let last = rows.len();
+fn build_screen(rows: Vec<String>, offset: usize, height: usize, statusbar: &StatusBar) -> String {
     rows.into_iter()
         .skip(offset)
-        .take(height)
+        .take(height - 1)
         .zip((offset + 1)..)
         .fold(String::from("\x1b[0;0H"), |acc, (row, idx)| {
-            acc + &build_row(&row, idx) + &(if idx - offset == height { "" } else { "\r\n" })
+            acc + &build_row(&row, idx) + "\r\n"
         })
+        + &(statusbar.render())
 }
 
 fn clean_line() -> String {
@@ -255,7 +295,7 @@ fn tick(state: State) -> Result<(String, State), String> {
         .update_right_bounds(current_line_length + 3, prev_line_length + 3, next_line_length + 3);
     let cursor = cursor.update_bounds(bounds);
     match io::stdin().bytes().next() {
-        Some(Ok(input)) if input == b'q' & 0x1f => Ok((cursor.move_to(0, 0).0 + &clean_display() + "Bye!", state)),
+        Some(Ok(input)) if input == b'q' & 0x1f => Ok((cursor.move_to(0, 0).0 + "Bye!", state)),
         Some(Ok(input)) if input == b'u' & 0x1f || input == b'd' & 0x1f => {
             let dy = if input == b'u' & 0x1f {
                 -(state.size.row as i32)
@@ -266,7 +306,12 @@ fn tick(state: State) -> Result<(String, State), String> {
             let (_, cursor) = cursor.move_by(0, dy);
             let viewport = state.viewport.update_with(&cursor);
             let move_cmd = cursor.move_cmd(viewport.offset.1);
-            let render_textarea_cmd = build_screen(state.rows.clone(), viewport.offset.1, state.size.row.into());
+            let render_textarea_cmd = build_screen(
+                state.rows.clone(),
+                viewport.offset.1,
+                state.size.row.into(),
+                &state.statusbar,
+            );
             let (show_cursor_cmd, cursor) = cursor.show();
             render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
             tick(State {
@@ -275,6 +320,7 @@ fn tick(state: State) -> Result<(String, State), String> {
                 termios: state.termios,
                 rows: state.rows,
                 viewport: viewport,
+                statusbar: state.statusbar,
             })
         }
         // todo: ネストが深くてつらいのであり得ないケースは unwrap,expect などで雑にハンドリングする
@@ -292,8 +338,12 @@ fn tick(state: State) -> Result<(String, State), String> {
                         };
                         let move_cmd = cursor.move_cmd(viewport.offset.1);
 
-                        let render_textarea_cmd =
-                            build_screen(state.rows.clone(), viewport.offset.1, state.size.row.into());
+                        let render_textarea_cmd = build_screen(
+                            state.rows.clone(),
+                            viewport.offset.1,
+                            state.size.row.into(),
+                            &state.statusbar,
+                        );
                         let (show_cursor_cmd, cursor) = cursor.show();
                         render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
                         tick(State {
@@ -302,6 +352,7 @@ fn tick(state: State) -> Result<(String, State), String> {
                             termios: state.termios,
                             rows: state.rows,
                             viewport: viewport,
+                            statusbar: state.statusbar,
                         })
                     }
                     // handle delete key
@@ -310,8 +361,12 @@ fn tick(state: State) -> Result<(String, State), String> {
                             let (_, cursor) = cursor.move_by(0, 0);
                             let move_cmd = cursor.move_cmd(state.viewport.offset.1);
 
-                            let render_textarea_cmd =
-                                build_screen(state.rows.clone(), state.viewport.offset.1, state.size.row.into());
+                            let render_textarea_cmd = build_screen(
+                                state.rows.clone(),
+                                state.viewport.offset.1,
+                                state.size.row.into(),
+                                &state.statusbar,
+                            );
                             let (show_cursor_cmd, cursor) = cursor.show();
 
                             render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
@@ -321,6 +376,7 @@ fn tick(state: State) -> Result<(String, State), String> {
                                 termios: state.termios,
                                 rows: state.rows,
                                 viewport: state.viewport,
+                                statusbar: state.statusbar,
                             })
                         }
                         _ => unimplemented!(),
@@ -344,7 +400,12 @@ fn tick(state: State) -> Result<(String, State), String> {
             };
             let move_cmd = cursor.move_cmd(viewport.offset.1);
 
-            let render_textarea_cmd = build_screen(state.rows.clone(), viewport.offset.1, state.size.row.into());
+            let render_textarea_cmd = build_screen(
+                state.rows.clone(),
+                viewport.offset.1,
+                state.size.row.into(),
+                &state.statusbar,
+            );
             let (show_cursor_cmd, cursor) = cursor.show();
             render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
             tick(State {
@@ -353,13 +414,18 @@ fn tick(state: State) -> Result<(String, State), String> {
                 termios: state.termios,
                 rows: state.rows,
                 viewport: viewport,
+                statusbar: state.statusbar,
             })
         }
         Some(Err(_)) => unimplemented!(),
         None => {
-            let (_, cursor) = cursor.move_by(0, 0);
             let move_cmd = cursor.move_cmd(state.viewport.offset.1);
-            let render_textarea_cmd = build_screen(state.rows.clone(), state.viewport.offset.1, state.size.row.into());
+            let render_textarea_cmd = build_screen(
+                state.rows.clone(),
+                state.viewport.offset.1,
+                state.size.row.into(),
+                &state.statusbar,
+            );
             let (show_cursor_cmd, cursor) = cursor.show();
             render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
             tick(State {
@@ -368,6 +434,7 @@ fn tick(state: State) -> Result<(String, State), String> {
                 termios: state.termios,
                 rows: state.rows,
                 viewport: state.viewport,
+                statusbar: state.statusbar,
             })
         }
     }
