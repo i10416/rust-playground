@@ -7,9 +7,6 @@
 antirez's kilo を少し改変したテキストエディタをRustで書く.
 
  */
-// todo: fix horizontal scroll
-// todo: insert chars
-// todo: delete chars
 // todo: save
 // todo: handle horizontal scroll
 // todo: replace recursion with loop
@@ -17,13 +14,16 @@ antirez's kilo を少し改変したテキストエディタをRustで書く.
 use std::fmt::Debug;
 use std::io::{self, BufRead, Read, Write};
 use std::os::raw::{c_char, c_uint};
-use std::os::unix::raw::mode_t;
 
 type Cflag = c_uint;
 type Speed = c_uint;
 const NCCS: usize = 32;
 const KILO_VERSION: &str = "0.0.0";
 const TAB_SIZE: usize = 4;
+const CLEAN_LINE_CMD: &str = "\x1b[K";
+const CTRL_Q: u8 = b'q' & 0x1f;
+const CTRL_U: u8 = b'u' & 0x1f;
+const CTRL_D: u8 = b'd' & 0x1f;
 // prevent memory layout optimization
 #[repr(C)]
 #[derive(Debug, Default)]
@@ -36,44 +36,6 @@ pub struct Termios {
     c_cc: [c_char; NCCS], /* control characters */
     c_ispeed: Speed,      /* input speed */
     c_ospeed: Speed,
-}
-#[derive(Debug)]
-struct Viewport {
-    // offset: (col,row)
-    offset: (usize, usize),
-    //  size: (col,row)
-    size: (usize, usize),
-    max_height: usize,
-}
-
-impl Viewport {
-    pub fn update_with(&self, cursor: &terminal::Cursor) -> Viewport {
-        let next_offset = match (cursor.col, cursor.row) {
-            (col, row) if row > self.offset.1 + self.size.1 - 1 && col > self.offset.0 + self.size.0 - 1 => {
-                (col - self.size.0 + 1, row - self.size.1 + 1)
-            }
-            (_, row) if row > self.offset.1 + self.size.1 - 1 => (self.offset.0, row - self.size.1 + 1),
-            (_, row) if row < self.offset.1 => (self.offset.0, row),
-            (col, _) if col > self.offset.0 + self.size.0 - 1 => (col - self.size.0 + 1, self.offset.1),
-            (col, _) if col < self.offset.0 => (col, self.offset.1),
-            _ => self.offset,
-        };
-        Viewport {
-            offset: next_offset,
-            size: self.size,
-            max_height: self.max_height,
-        }
-    }
-
-    pub fn contains(&self, cursor: &terminal::Cursor) -> bool {
-        match (cursor.col, cursor.row) {
-            (col, _) if col > self.offset.0 + self.size.0 - 1 => false,
-            (col, _) if col < self.offset.0 => false,
-            (_, row) if row > self.offset.1 + self.size.1 - 1 => false,
-            (_, row) if row < self.offset.1 => false,
-            _ => true,
-        }
-    }
 }
 
 #[link(name = "texteditor.a")]
@@ -96,9 +58,9 @@ struct State<'a> {
     cursor: terminal::Cursor,
     size: terminal::TermSize,
     rows: Vec<String>,
-    viewport: Viewport,
+    viewport: terminal::Viewport,
     statusbar: StatusBar<'a>,
-    mode: Mode,
+    mode: &'a Mode,
 }
 
 impl<'a> State<'a> {
@@ -107,7 +69,7 @@ impl<'a> State<'a> {
         size: terminal::TermSize,
         cursor: terminal::Cursor,
         rows: Vec<String>,
-        viewport: Viewport,
+        viewport: terminal::Viewport,
         statusbar: StatusBar<'a>,
         mode: Mode,
     ) -> State<'a> {
@@ -118,7 +80,7 @@ impl<'a> State<'a> {
             rows: rows,
             viewport: viewport,
             statusbar: statusbar,
-            mode: Mode::Visual,
+            mode: &Mode::Visual,
         }
     }
 }
@@ -130,8 +92,9 @@ struct StatusBar<'a> {
     has_change: bool,
     width: usize,
 }
+
 impl<'a> StatusBar<'a> {
-    pub fn render(&self, mode: &Mode) -> String {
+    fn render(&self, mode: &Mode, cursor: &terminal::Cursor) -> String {
         let truncated_filename = self
             .filename
             .map(|s| {
@@ -148,13 +111,31 @@ impl<'a> StatusBar<'a> {
         };
 
         format!(
-            "\x1b[7m{}{}{} lines[{}]\x1b[m",
+            "\x1b[7m{}{}{}({},{}) lines[{}]\x1b[m",
             truncated_filename,
-            " ".repeat(self.width - 8 - truncated_filename.len() - self.lines.to_string().len() - mode_type.len()),
+            " ".repeat(std::cmp::max(
+                0,
+                self.width
+                    - 11
+                    - truncated_filename.len()
+                    - self.lines.to_string().len()
+                    - mode_type.len()
+                    - cursor.col.to_string().len()
+                    - cursor.row.to_string().len()
+            )),
             self.lines,
+            cursor.col,
+            cursor.row,
             mode_type
         )
     }
+}
+
+fn init_canvas() {
+    io::stdout()
+        .write(clean_display().as_bytes())
+        .and_then(|_| io::stdout().flush())
+        .expect("success");
 }
 
 fn replace_tabs(line: String) -> String {
@@ -187,12 +168,9 @@ fn main() -> Result<(), ()> {
         .map(|row| replace_tabs(row))
         .collect();
     let pad_size = rows.len().to_string().len();
-    io::stdout()
-        .write(clean_display().as_bytes())
-        .and_then(|_| io::stdout().flush())
-        .expect("success");
+    init_canvas();
     let content_width = std::cmp::max((term_size.col as i32) - (pad_size as i32) - 2, 0) as usize;
-    let viewport = Viewport {
+    let viewport = terminal::Viewport {
         offset: (0, 0),
         size: (content_width, (term_size.row - 1).into()),
         max_height: rows.len() - 1,
@@ -239,11 +217,17 @@ fn read_file(file_path: &str) -> Result<Vec<String>, std::io::Error> {
         Err(e) => Err(e),
     }
 }
+
+fn write_file(file_path: String, text: String) -> Result<(), std::io::Error> {
+    let f = std::fs::File::open(file_path);
+    unimplemented!()
+}
+
 /*
 * prepend leading symbol ~<row_number>: and append clean_line escape sequence to row
 */
-fn build_row(content: &str, idx: usize, pad_size: usize, viewport: &Viewport) -> String {
-    let visibleContent = match (viewport.offset.0, viewport.size.0) {
+fn build_row(content: &str, idx: usize, pad_size: usize, viewport: &terminal::Viewport) -> String {
+    let visible_content = match (viewport.offset.0, viewport.size.0) {
         (col_offset, _) if col_offset >= content.len() => "",
         (col_offset, viewport_width) => content
             .get(col_offset..std::cmp::min(content.len(), col_offset + viewport_width))
@@ -252,43 +236,39 @@ fn build_row(content: &str, idx: usize, pad_size: usize, viewport: &Viewport) ->
     format!(
         "~{}:{}{}",
         format!("{:0>width$}", idx, width = pad_size),
-        visibleContent,
-        clean_line()
+        visible_content,
+        CLEAN_LINE_CMD
     )
 }
 
 fn build_screen(
     rows: Vec<String>,
     pad_size: usize,
-    offset: usize,
-    height: usize,
-    viewport: &Viewport,
+    viewport: &terminal::Viewport,
     mode: &Mode,
     statusbar: &StatusBar,
+    cursor: &terminal::Cursor,
 ) -> String {
+    let offset = viewport.offset.1;
     rows.into_iter()
         .skip(offset)
-        .take(height - 1)
+        .take(viewport.size.1)
         .zip((offset + 1)..)
         .fold(String::from("\x1b[0;0H"), |acc, (row, idx)| {
             acc + &build_row(&row, idx, pad_size, viewport) + "\r\n"
         })
-        + &(statusbar.render(mode))
-}
-
-fn clean_line() -> String {
-    String::from("\x1b[K")
+        + &(statusbar.render(mode, cursor))
 }
 
 fn build_welcome_message(col_count: u16, row_number: usize) -> String {
     match format!("Rusty Editor -- version {}", KILO_VERSION) {
-        s if s.len() > col_count.into() => s[..col_count.into()].to_string() + &clean_line(),
+        s if s.len() > col_count.into() => s[..col_count.into()].to_string() + CLEAN_LINE_CMD,
         s => {
             format!("~{}:", row_number)
                 + &" ".repeat((col_count as usize) / 2 - s.len() / 2 - 3)
                 + &s
                 + &" ".repeat((col_count as usize) / 2 - s.len() / 2)
-                + &clean_line()
+                + CLEAN_LINE_CMD
         }
     }
 }
@@ -319,6 +299,10 @@ fn render(cmd: String) {
     io::stdout().flush().expect("success");
 }
 
+fn is_valid_char(c: u8) -> bool {
+    c.is_ascii_alphabetic() || c.is_ascii_alphanumeric() || c.is_ascii_digit()
+}
+
 fn tick(state: State) -> Result<(String, State), String> {
     let (hide_cursor_cmd, cursor) = state.cursor.hide();
 
@@ -337,25 +321,23 @@ fn tick(state: State) -> Result<(String, State), String> {
     );
     let cursor = cursor.update_bounds(bounds);
     match io::stdin().bytes().next() {
-        Some(Ok(input)) if input == b'q' & 0x1f => Ok((String::from("Bye!"), state)),
-        Some(Ok(input)) if input == b'u' & 0x1f || input == b'd' & 0x1f => {
-            let dy = if input == b'u' & 0x1f {
+        Some(Ok(CTRL_Q)) => Ok((String::from("Bye!"), state)),
+        Some(Ok(input @ (CTRL_U | CTRL_D))) => {
+            let dy = if input == CTRL_U {
                 -(state.size.row as i32)
             } else {
                 state.size.row as i32
             };
             // move cursor by termSize.height
-            let (_, cursor) = cursor.move_by(0, dy);
-            let viewport = state.viewport.update_with(&cursor);
+            let (_, cursor, viewport) = cursor.move_by(0, dy, state.viewport);
             let move_cmd = cursor.move_cmd(viewport.offset.1);
             let render_textarea_cmd = build_screen(
                 state.rows.clone(),
                 pad_size,
-                viewport.offset.1,
-                state.size.row.into(),
                 &viewport,
                 &state.mode,
                 &state.statusbar,
+                &cursor,
             );
             let (show_cursor_cmd, cursor) = cursor.show();
             render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
@@ -376,22 +358,16 @@ fn tick(state: State) -> Result<(String, State), String> {
                 Some(Ok(b'[')) => match io::stdin().bytes().next() {
                     Some(Ok(input @ (b'A' | b'B' | b'C' | b'D'))) => {
                         let (dx, dy) = arrow_key_to_move(input);
-                        let (_, cursor) = cursor.move_by(dx, dy);
-                        let viewport = if state.viewport.contains(&cursor) {
-                            state.viewport
-                        } else {
-                            state.viewport.update_with(&cursor)
-                        };
+                        let (_, cursor, viewport) = cursor.move_by(dx, dy, state.viewport);
                         let move_cmd = cursor.move_cmd(viewport.offset.1);
 
                         let render_textarea_cmd = build_screen(
                             state.rows.clone(),
                             pad_size,
-                            viewport.offset.1,
-                            state.size.row.into(),
                             &viewport,
                             &state.mode,
                             &state.statusbar,
+                            &cursor,
                         );
                         let (show_cursor_cmd, cursor) = cursor.show();
                         render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
@@ -413,11 +389,10 @@ fn tick(state: State) -> Result<(String, State), String> {
                             let render_textarea_cmd = build_screen(
                                 state.rows.clone(),
                                 pad_size,
-                                state.viewport.offset.1,
-                                state.size.row.into(),
                                 &state.viewport,
                                 &state.mode,
                                 &state.statusbar,
+                                &cursor,
                             );
                             let (show_cursor_cmd, cursor) = cursor.show();
 
@@ -440,17 +415,17 @@ fn tick(state: State) -> Result<(String, State), String> {
                 },
                 Some(Ok(_)) => unimplemented!(),
                 Some(Err(_)) => unimplemented!(),
+                // esc key
                 None => {
                     let move_cmd = cursor.move_cmd(state.viewport.offset.1);
 
                     let render_textarea_cmd = build_screen(
                         state.rows.clone(),
                         pad_size,
-                        state.viewport.offset.1,
-                        state.size.row.into(),
                         &state.viewport,
                         &state.mode,
                         &state.statusbar,
+                        &cursor,
                     );
                     let (show_cursor_cmd, cursor) = cursor.show();
 
@@ -462,22 +437,21 @@ fn tick(state: State) -> Result<(String, State), String> {
                         rows: state.rows,
                         viewport: state.viewport,
                         statusbar: state.statusbar,
-                        mode: Mode::Visual,
+                        mode: &Mode::Visual,
                     })
                 }
             }
         }
-        Some(Ok(input)) if input == b'i' && state.mode == Mode::Visual => {
+        Some(Ok(b'i')) if state.mode.eq(&Mode::Visual) => {
             let move_cmd = cursor.move_cmd(state.viewport.offset.1);
 
             let render_textarea_cmd = build_screen(
                 state.rows.clone(),
                 pad_size,
-                state.viewport.offset.1,
-                state.size.row.into(),
                 &state.viewport,
                 &state.mode,
                 &state.statusbar,
+                &cursor,
             );
             let (show_cursor_cmd, cursor) = cursor.show();
 
@@ -489,20 +463,107 @@ fn tick(state: State) -> Result<(String, State), String> {
                 rows: state.rows,
                 viewport: state.viewport,
                 statusbar: state.statusbar,
-                mode: Mode::Insert,
+                mode: &Mode::Insert,
             })
         }
-        Some(Ok(input)) if state.mode == Mode::Insert => {
+        // backspace
+        Some(Ok(input)) if input == b'h' & 0x1f || input == 127 && state.mode.eq(&Mode::Visual) => {
+            let (move_cmd, cursor, viewport) = cursor.move_by(-1, 0, state.viewport);
+            let render_textarea_cmd = build_screen(
+                state.rows.clone(),
+                pad_size,
+                &viewport,
+                &state.mode,
+                &state.statusbar,
+                &cursor,
+            );
+            let (show_cursor_cmd, cursor) = cursor.show();
+
+            render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
+            tick(State {
+                size: state.size,
+                cursor: cursor,
+                termios: state.termios,
+                rows: state.rows,
+                viewport: viewport,
+                statusbar: state.statusbar,
+                mode: state.mode,
+            })
+        }
+        Some(Ok(input)) if input == b'h' & 0x1f || input == 127 && state.mode.eq(&Mode::Insert) => {
+            let (move_cmd, next_cursor, viewport) = cursor.move_by(-1, 0, state.viewport);
+
+            let (rows, cursor): (Vec<String>, terminal::Cursor) = if next_cursor.row < cursor.row {
+                match state.rows.split_at(cursor.row) {
+                    (front, &[]) => (
+                        front.to_vec(),
+                        next_cursor.update_bounds(next_cursor.bounds.update_right_bounds(
+                            next_cursor.bounds.right,
+                            next_cursor.bounds.right_prev_line,
+                            cursor.bounds.right_next_line,
+                        )),
+                    ),
+                    (front, tail) => (
+                        [front,tail].concat(),
+                        next_cursor,
+                    ),
+                }
+            } else {
+                match state.rows.split_at(next_cursor.row) {
+                    (front, &[]) => (
+                        front.to_vec(),
+                        next_cursor.update_bounds(next_cursor.bounds.update_right_bounds(
+                            next_cursor.bounds.right - 1,
+                            next_cursor.bounds.right_prev_line,
+                            next_cursor.bounds.right_next_line,
+                        )),
+                    ),
+                    (front, [row, tail @ ..]) => {
+                        let mut row = row.clone();
+                        row.remove(cursor.col - cursor.bounds.left - 1);
+                        (
+                            [front, &[row], tail].concat(),
+                            next_cursor.update_bounds(next_cursor.bounds.update_right_bounds(
+                                next_cursor.bounds.right - 1,
+                                next_cursor.bounds.right_prev_line,
+                                next_cursor.bounds.right_next_line,
+                            )),
+                        )
+                    }
+                }
+            };
+            let render_textarea_cmd = build_screen(
+                rows.clone(),
+                pad_size,
+                &viewport,
+                &state.mode,
+                &state.statusbar,
+                &cursor,
+            );
+            let (show_cursor_cmd, cursor) = cursor.show();
+
+            render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
+            tick(State {
+                size: state.size,
+                cursor: cursor,
+                termios: state.termios,
+                rows: rows,
+                viewport: viewport,
+                statusbar: state.statusbar,
+                mode: state.mode,
+            })
+        }
+        Some(Ok(input)) if state.mode.eq(&Mode::Insert) && is_valid_char(input) => {
             let rows: Vec<String> = state
                 .rows
                 .into_iter()
                 .zip(0..)
                 .map(|(row, idx)| {
                     if idx == cursor.row {
-                        if cursor.col + 1 > row.len() {
+                        if cursor.col - cursor.bounds.left > row.len() {
                             format!("{}{}", row, input as char)
                         } else {
-                            let (front, back) = row.split_at(cursor.col);
+                            let (front, back) = row.split_at(cursor.col - cursor.bounds.left);
                             [front, &(input as char).to_string(), back].join("")
                         }
                     } else {
@@ -515,16 +576,15 @@ fn tick(state: State) -> Result<(String, State), String> {
                 cursor.bounds.right_prev_line,
                 cursor.bounds.right_next_line,
             ));
-            let (move_cmd, cursor) = cursor.move_by(1, 0);
+            let (move_cmd, cursor, viewport) = cursor.move_by(1, 0, state.viewport);
 
             let render_textarea_cmd = build_screen(
                 rows.clone(),
                 pad_size,
-                state.viewport.offset.1,
-                state.size.row.into(),
-                &state.viewport,
+                &viewport,
                 &state.mode,
                 &state.statusbar,
+                &cursor,
             );
             let (show_cursor_cmd, cursor) = cursor.show();
 
@@ -534,29 +594,23 @@ fn tick(state: State) -> Result<(String, State), String> {
                 cursor: cursor,
                 termios: state.termios,
                 rows: rows,
-                viewport: state.viewport,
+                viewport: viewport,
                 statusbar: state.statusbar,
-                mode: Mode::Insert,
+                mode: &Mode::Insert,
             })
         }
         Some(Ok(input)) => {
             let (dx, dy) = key_to_move(input);
-            let (_, cursor) = cursor.move_by(dx, dy);
-            let viewport = if state.viewport.contains(&cursor) {
-                state.viewport
-            } else {
-                state.viewport.update_with(&cursor)
-            };
+            let (_, cursor, viewport) = cursor.move_by(dx, dy, state.viewport);
             let move_cmd = cursor.move_cmd(viewport.offset.1);
 
             let render_textarea_cmd = build_screen(
                 state.rows.clone(),
                 pad_size,
-                viewport.offset.1,
-                state.size.row.into(),
                 &viewport,
                 &state.mode,
                 &state.statusbar,
+                &cursor,
             );
             let (show_cursor_cmd, cursor) = cursor.show();
             render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
@@ -576,11 +630,10 @@ fn tick(state: State) -> Result<(String, State), String> {
             let render_textarea_cmd = build_screen(
                 state.rows.clone(),
                 pad_size,
-                state.viewport.offset.1,
-                state.size.row.into(),
                 &state.viewport,
                 &state.mode,
                 &state.statusbar,
+                &cursor,
             );
             let (show_cursor_cmd, cursor) = cursor.show();
             render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
@@ -600,6 +653,45 @@ fn tick(state: State) -> Result<(String, State), String> {
 mod terminal {
     use std::io::{self, Read, Write};
     use std::os::raw::c_ushort;
+
+    #[derive(Debug)]
+    pub struct Viewport {
+        // offset: (col,row)
+        pub offset: (usize, usize),
+        //  size: (col,row)
+        pub size: (usize, usize),
+        pub max_height: usize,
+    }
+
+    impl Viewport {
+        pub fn update_with(&self, cursor: &Cursor) -> Viewport {
+            let next_offset = match (cursor.col, cursor.row) {
+                (col, row) if row > self.offset.1 + self.size.1 - 1 && col > self.offset.0 + self.size.0 - 1 => {
+                    (col - self.size.0 + 1, row - self.size.1 + 1)
+                }
+                (_, row) if row > self.offset.1 + self.size.1 - 1 => (self.offset.0, row - self.size.1 + 1),
+                (_, row) if row < self.offset.1 => (self.offset.0, row),
+                (col, _) if col > self.offset.0 + self.size.0 - 1 => (col - self.size.0 + 1, self.offset.1),
+                (col, _) if col < self.offset.0 => (col, self.offset.1),
+                _ => self.offset,
+            };
+            Viewport {
+                offset: next_offset,
+                size: self.size,
+                max_height: self.max_height,
+            }
+        }
+
+        pub fn contains(&self, cursor: &Cursor) -> bool {
+            match (cursor.col, cursor.row) {
+                (col, _) if col > self.offset.0 + self.size.0 - 1 => false,
+                (col, _) if col < self.offset.0 => false,
+                (_, row) if row > self.offset.1 + self.size.1 - 1 => false,
+                (_, row) if row < self.offset.1 => false,
+                _ => true,
+            }
+        }
+    }
 
     #[derive(Debug)]
     pub struct Cursor {
@@ -682,27 +774,67 @@ mod terminal {
             }
         }
 
-        pub fn move_by(&self, col: i32, row: i32) -> (String, Cursor) {
+        pub fn move_by(&self, d_col: i32, d_row: i32, viewport: Viewport) -> (String, Cursor, Viewport) {
             match (
-                self.col as i32 + col,
-                (self.row as i32 + row).clamp(self.bounds.top as i32, self.bounds.bottom as i32),
+                self.col as i32 + d_col,
+                (self.row as i32 + d_row).clamp(self.bounds.top as i32, self.bounds.bottom as i32),
             ) {
-                (col, row) if self.bounds.contains(col, row) => self.move_to(col as usize, row as usize),
+                (col, row) if self.bounds.contains(col, row) => {
+                    let (cmd, cursor) = self.move_to(col as usize, row as usize);
+                    if viewport.contains(&cursor) {
+                        (cmd, cursor, viewport)
+                    } else {
+                        let viewport = viewport.update_with(&cursor);
+                        (cmd, cursor, viewport)
+                    }
+                }
                 (col, row) if col > self.bounds.right as i32 => {
                     // move to next line start
-                    self.move_to(
+                    let (cmd, cursor) = self.move_to(
                         self.bounds.left,
                         std::cmp::min(row + 1, self.bounds.bottom as i32) as usize,
-                    )
+                    );
+                    if viewport.contains(&cursor) {
+                        (cmd, cursor, viewport)
+                    } else {
+                        let viewport = viewport.update_with(&cursor);
+                        (cmd, cursor, viewport)
+                    }
+                }
+                (col, row) if col < self.bounds.left as i32 && viewport.offset.0 > 0 => {
+                    let (cmd, cursor) = self.move_to(self.bounds.left, row as usize);
+                    let viewport = Viewport {
+                        offset: (
+                            std::cmp::max(viewport.offset.0 as i32 + d_col, 0) as usize,
+                            viewport.offset.1,
+                        ),
+                        size: viewport.size,
+                        max_height: viewport.max_height,
+                    };
+                    (cmd, cursor, viewport)
                 }
                 (col, row) if col < self.bounds.left as i32 => {
                     // move to prev line end
-                    self.move_to(self.bounds.right_prev_line, std::cmp::max(row - 1, 0) as usize)
+                    let (cmd, cursor) = self.move_to(self.bounds.right_prev_line, std::cmp::max(row - 1, 0) as usize);
+                    if viewport.contains(&cursor) {
+                        (cmd, cursor, viewport)
+                    } else {
+                        let viewport = viewport.update_with(&cursor);
+                        (cmd, cursor, viewport)
+                    }
                 }
-                _ => self.move_to(
-                    (self.col as i32 + col).clamp(self.bounds.left as i32, self.bounds.right as i32) as usize,
-                    (self.row as i32 + row).clamp(self.bounds.top as i32, self.bounds.bottom as i32) as usize,
-                ),
+                _ => {
+                    let (cmd, cursor) = self.move_to(
+                        (self.col as i32 + d_col).clamp(self.bounds.left as i32, self.bounds.right as i32) as usize,
+                        (self.row as i32 + d_row).clamp(self.bounds.top as i32, self.bounds.bottom as i32) as usize,
+                    );
+                    if viewport.contains(&cursor) {
+                        (cmd, cursor, viewport)
+                    } else {
+                        let viewport = viewport.update_with(&cursor);
+                        (cmd, cursor, viewport)
+                    }
+                }
             }
         }
 
@@ -710,7 +842,7 @@ mod terminal {
             format!("\x1b[{};{}H", self.row - offset + 1, self.col + 1)
         }
 
-        pub fn move_to(&self, col: usize, row: usize) -> (String, Cursor) {
+        fn move_to(&self, col: usize, row: usize) -> (String, Cursor) {
             let next = match row {
                 next_row if next_row > self.row => Cursor {
                     row: next_row.clamp(self.bounds.top, self.bounds.bottom),
@@ -785,7 +917,7 @@ mod terminal {
     }
 
     pub fn get_term_size_fallback() -> Result<(u16, u16), std::io::Error> {
-        let (cmd, _) = Cursor::origin(0, 999, 999).1.move_by(999, 999);
+        let cmd = "\x1b[999;999H";
         // attempt to move cursor at right bottom
         io::stdout().write(cmd.as_bytes())?;
 
