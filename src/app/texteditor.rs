@@ -8,7 +8,10 @@ antirez's kilo を少し改変したテキストエディタをRustで書く.
 
  */
 
-// todo: handle viewport offset
+// todo: set cursor bounds
+// todo: handle horizontal scroll
+// todo: replace recursion with loop
+// todo: use stream and event
 use std::fmt::Debug;
 use std::io::{self, BufRead, Read, Write};
 use std::os::raw::{c_char, c_uint};
@@ -17,6 +20,7 @@ type Cflag = c_uint;
 type Speed = c_uint;
 const NCCS: usize = 32;
 const KILO_VERSION: &str = "0.0.0";
+const TAB_SIZE: usize = 4;
 // prevent memory layout optimization
 #[repr(C)]
 #[derive(Debug, Default)]
@@ -42,12 +46,12 @@ struct Viewport {
 impl Viewport {
     pub fn update_with(&self, cursor: &terminal::Cursor) -> Viewport {
         let next_offset = match (cursor.col, cursor.row) {
-            (col, row) if row > self.offset.1 + self.size.1 && col > self.offset.0 + self.size.0 => {
-                (col - self.size.0, row - self.size.1)
+            (col, row) if row > self.offset.1 + self.size.1 - 1 && col > self.offset.0 + self.size.0 - 1 => {
+                (col - self.size.0 + 1, row - self.size.1 + 1)
             }
-            (_, row) if row > self.offset.1 + self.size.1 => (self.offset.0, row - self.size.1),
+            (_, row) if row > self.offset.1 + self.size.1 - 1 => (self.offset.0, row - self.size.1 + 1),
             (_, row) if row < self.offset.1 => (self.offset.0, row),
-            (col, _) if col > self.offset.0 + self.size.0 => (col - self.size.0, self.offset.1),
+            (col, _) if col > self.offset.0 + self.size.0 - 1 => (col - self.size.0 + 1, self.offset.1),
             (col, _) if col < self.offset.0 => (col, self.offset.1),
             _ => self.offset,
         };
@@ -60,22 +64,12 @@ impl Viewport {
 
     pub fn contains(&self, cursor: &terminal::Cursor) -> bool {
         match (cursor.col, cursor.row) {
-            (col, _) if col > self.offset.0 + self.size.0 => false,
+            (col, _) if col > self.offset.0 + self.size.0 - 1 => false,
             (col, _) if col < self.offset.0 => false,
-            (_, row) if row > self.offset.1 + self.size.1 => false,
+            (_, row) if row > self.offset.1 + self.size.1 - 1 => false,
             (_, row) if row < self.offset.1 => false,
             _ => true,
         }
-    }
-}
-
-impl std::fmt::Display for Termios {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Termios({},{},{},{},{})",
-            self.c_cflag, self.c_iflag, self.c_ispeed, self.c_ospeed, self.c_lflag
-        )
     }
 }
 
@@ -93,7 +87,7 @@ struct State {
     cursor: terminal::Cursor,
     size: terminal::TermSize,
     rows: Vec<String>,
-    viewport: Viewport, //: Viewport{rows:rows,offset:(top,left)}
+    viewport: Viewport,
 }
 
 impl State {
@@ -125,8 +119,23 @@ fn main() -> Result<(), ()> {
     }
     .unwrap();
     let term_size = terminal::get_terminal_size().unwrap();
-    let (_, cursor) = terminal::Cursor::origin();
-    let rows = read_file("README.md").unwrap_or(vec![build_welcome_message(term_size.col, 1)]);
+    let rows: Vec<String> = read_file("README.md")
+        .unwrap_or(vec![build_welcome_message(term_size.col, 1)])
+        .into_iter()
+        .map(|row| {
+            row.chars()
+                .zip(0..)
+                .map(|(c, idx)| {
+                    if c == '\t' {
+                        " ".repeat(TAB_SIZE - (idx % TAB_SIZE))
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect::<String>()
+        })
+        .collect();
+    let (_, cursor) = terminal::Cursor::origin(rows.first().map_or(0, |s| s.len()), rows.len() - 1);
     io::stdout()
         .write(clean_display().as_bytes())
         .and_then(|_| io::stdout().flush())
@@ -153,7 +162,9 @@ fn main() -> Result<(), ()> {
 fn clean_display() -> String {
     String::from("\x1b[2J")
 }
-
+/*
+* read file into Vec<String>. each element of the vec represents a row.
+ */
 fn read_file(file_path: &str) -> Result<Vec<String>, std::io::Error> {
     let f = std::fs::File::open(file_path);
     match f {
@@ -168,20 +179,24 @@ fn read_file(file_path: &str) -> Result<Vec<String>, std::io::Error> {
         Err(e) => Err(e),
     }
 }
-
+/*
+* prepend leading symbol ~<row_number>: and append clean_line escape sequence to row
+*/
 fn build_row(content: &str, idx: usize) -> String {
     format!("~{}:{} {}", idx, content, clean_line())
 }
-fn build_screen(rows: Vec<String>) -> String {
+
+fn build_screen(rows: Vec<String>, offset: usize, height: usize) -> String {
     let last = rows.len();
-    rows.into_iter().zip(1..).fold(String::new(), |acc, (s, i)| {
-        acc + &s + &(if i == last { "" } else { "\r\n" })
-    })
+    rows.into_iter()
+        .skip(offset)
+        .take(height)
+        .zip((offset + 1)..)
+        .fold(String::from("\x1b[0;0H"), |acc, (row, idx)| {
+            acc + &build_row(&row, idx) + &(if idx - offset == height { "" } else { "\r\n" })
+        })
 }
-// todo: render_screen(previous_state,reducer)
-fn render_screen(rows: Vec<String>) {
-    rows.into_iter().zip(1..).for_each(|(row, row_number)| {})
-}
+
 fn clean_line() -> String {
     String::from("\x1b[K")
 }
@@ -219,22 +234,49 @@ fn arrow_key_to_move(c: u8) -> (i32, i32) {
     }
 }
 
+fn render(cmd: String) {
+    io::stdout().write(cmd.as_bytes()).unwrap();
+    // disable buffer
+    io::stdout().flush().expect("success");
+}
+
 fn tick(state: State) -> Result<(String, State), String> {
     let (hide_cursor_cmd, cursor) = state.cursor.hide();
-    let (set_cursor_cmd, _) = cursor.move_to(0, 0); // cursor.move_to(viewport.offset);
-    let render_textarea_cmd = build_screen(
-        state
-            .rows
-            .clone()
-            .into_iter()
-            .skip(state.viewport.offset.1)
-            .take(state.size.row.into())
-            .zip((state.viewport.offset.1 + 1)..)
-            .map(|(row, idx)| build_row(&row, idx))
-            .collect(),
-    );
+
+    let current_line_length = state.rows[cursor.row].len();
+    let prev_line_length = if cursor.row == cursor.bounds.top {
+        state.rows[cursor.bounds.top].len()
+    } else {
+        state.rows[cursor.row - 1].len()
+    };
+    let next_line_length = state.rows[std::cmp::min(cursor.row + 1, cursor.bounds.bottom)].len();
+    let bounds = cursor
+        .bounds
+        .update_right_bounds(current_line_length + 3, prev_line_length + 3, next_line_length + 3);
+    let cursor = cursor.update_bounds(bounds);
     match io::stdin().bytes().next() {
         Some(Ok(input)) if input == b'q' & 0x1f => Ok((cursor.move_to(0, 0).0 + &clean_display() + "Bye!", state)),
+        Some(Ok(input)) if input == b'u' & 0x1f || input == b'd' & 0x1f => {
+            let dy = if input == b'u' & 0x1f {
+                -(state.size.row as i32)
+            } else {
+                state.size.row as i32
+            };
+            // move cursor by termSize.height
+            let (_, cursor) = cursor.move_by(0, dy);
+            let viewport = state.viewport.update_with(&cursor);
+            let move_cmd = cursor.move_cmd(viewport.offset.1);
+            let render_textarea_cmd = build_screen(state.rows.clone(), viewport.offset.1, state.size.row.into());
+            let (show_cursor_cmd, cursor) = cursor.show();
+            render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
+            tick(State {
+                size: state.size,
+                cursor: cursor,
+                termios: state.termios,
+                rows: state.rows,
+                viewport: viewport,
+            })
+        }
         // todo: ネストが深くてつらいのであり得ないケースは unwrap,expect などで雑にハンドリングする
         // handle arrow keys(\x1b[A,\x1b[B,\x1b[C,\x1b[D)
         Some(Ok(b'\x1b')) => {
@@ -242,22 +284,18 @@ fn tick(state: State) -> Result<(String, State), String> {
                 Some(Ok(b'[')) => match io::stdin().bytes().next() {
                     Some(Ok(input @ (b'A' | b'B' | b'C' | b'D'))) => {
                         let (dx, dy) = arrow_key_to_move(input);
-                        // let cursor_bounds = (left,top,right,bottom) = (0,0,rows(cursor.row).length-1,state.rows.length);
                         let (_, cursor) = cursor.move_by(dx, dy);
                         let viewport = if state.viewport.contains(&cursor) {
                             state.viewport
                         } else {
                             state.viewport.update_with(&cursor)
                         };
+                        let move_cmd = cursor.move_cmd(viewport.offset.1);
+
+                        let render_textarea_cmd =
+                            build_screen(state.rows.clone(), viewport.offset.1, state.size.row.into());
                         let (show_cursor_cmd, cursor) = cursor.show();
-                        io::stdout()
-                            .write(
-                                (hide_cursor_cmd + &set_cursor_cmd + &render_textarea_cmd + &show_cursor_cmd)
-                                    .as_bytes(),
-                            )
-                            .unwrap();
-                        // disable buffer
-                        io::stdout().flush().expect("success");
+                        render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
                         tick(State {
                             size: state.size,
                             cursor: cursor,
@@ -267,29 +305,26 @@ fn tick(state: State) -> Result<(String, State), String> {
                         })
                     }
                     // handle delete key
-                    Some(Ok(b'3')) => {
-                        match io::stdin().bytes().peekable().peek() {
-                            Some(Ok(b'~')) => {
-                                let (show_cursor_cmd, cursor) = cursor.show();
-                                io::stdout()
-                                    .write(
-                                        (hide_cursor_cmd + &set_cursor_cmd + &render_textarea_cmd + &show_cursor_cmd)
-                                            .as_bytes(),
-                                    )
-                                    .unwrap();
-                                // disable buffer
-                                io::stdout().flush().expect("success");
-                                tick(State {
-                                    size: state.size,
-                                    cursor: cursor,
-                                    termios: state.termios,
-                                    rows: state.rows,
-                                    viewport: state.viewport,
-                                })
-                            }
-                            _ => unimplemented!(),
+                    Some(Ok(b'3')) => match io::stdin().bytes().peekable().peek() {
+                        Some(Ok(b'~')) => {
+                            let (_, cursor) = cursor.move_by(0, 0);
+                            let move_cmd = cursor.move_cmd(state.viewport.offset.1);
+
+                            let render_textarea_cmd =
+                                build_screen(state.rows.clone(), state.viewport.offset.1, state.size.row.into());
+                            let (show_cursor_cmd, cursor) = cursor.show();
+
+                            render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
+                            tick(State {
+                                size: state.size,
+                                cursor: cursor,
+                                termios: state.termios,
+                                rows: state.rows,
+                                viewport: state.viewport,
+                            })
                         }
-                    }
+                        _ => unimplemented!(),
+                    },
                     _ => {
                         unimplemented!()
                     }
@@ -307,12 +342,11 @@ fn tick(state: State) -> Result<(String, State), String> {
             } else {
                 state.viewport.update_with(&cursor)
             };
+            let move_cmd = cursor.move_cmd(viewport.offset.1);
+
+            let render_textarea_cmd = build_screen(state.rows.clone(), viewport.offset.1, state.size.row.into());
             let (show_cursor_cmd, cursor) = cursor.show();
-            io::stdout()
-                .write((hide_cursor_cmd + &set_cursor_cmd + &render_textarea_cmd + &show_cursor_cmd).as_bytes())
-                .unwrap();
-            // disable buffer
-            io::stdout().flush().expect("success");
+            render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
             tick(State {
                 size: state.size,
                 cursor: cursor,
@@ -323,11 +357,11 @@ fn tick(state: State) -> Result<(String, State), String> {
         }
         Some(Err(_)) => unimplemented!(),
         None => {
+            let (_, cursor) = cursor.move_by(0, 0);
+            let move_cmd = cursor.move_cmd(state.viewport.offset.1);
+            let render_textarea_cmd = build_screen(state.rows.clone(), state.viewport.offset.1, state.size.row.into());
             let (show_cursor_cmd, cursor) = cursor.show();
-            io::stdout()
-                .write((hide_cursor_cmd + &set_cursor_cmd + &render_textarea_cmd + &show_cursor_cmd).as_bytes())
-                .unwrap();
-            io::stdout().flush().expect("success");
+            render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
             tick(State {
                 size: state.size,
                 cursor: cursor,
@@ -348,33 +382,132 @@ mod terminal {
         pub row: usize,
         pub col: usize,
         pub visibility: bool,
+        pub bounds: Bounds,
     }
+    #[derive(Debug, Clone)]
+    pub struct Bounds {
+        pub left: usize,
+        pub top: usize,
+        pub right: usize,
+        pub bottom: usize,
+        pub right_next_line: usize,
+        pub right_prev_line: usize,
+    }
+    impl Bounds {
+        pub fn new(
+            left: usize,
+            top: usize,
+            right: usize,
+            bottom: usize,
+            right_prev_line: usize,
+            right_next_line: usize,
+        ) -> Bounds {
+            Bounds {
+                left: left,
+                top: top,
+                right: right,
+                bottom: bottom,
+                right_prev_line: right_prev_line,
+                right_next_line: right_next_line,
+            }
+        }
+        pub fn update_right_bounds(&self, right: usize, right_prev_line: usize, right_next_line: usize) -> Bounds {
+            Bounds {
+                left: self.left,
+                top: self.top,
+                right: right,
+                bottom: self.bottom,
+                right_next_line: right_next_line,
+                right_prev_line: right_prev_line,
+            }
+        }
+
+        pub fn contains(&self, col: i32, row: i32) -> bool {
+            self.contains_horizontal(row) && self.contains_vertical(col)
+        }
+
+        fn contains_vertical(&self, col: i32) -> bool {
+            (self.left as i32) <= col && col <= (self.right as i32)
+        }
+
+        fn contains_horizontal(&self, row: i32) -> bool {
+            (self.top as i32) <= row && row <= (self.bottom as i32)
+        }
+    }
+
     // todo: handle terminal size bounds
     impl Cursor {
-        pub fn origin() -> (String, Cursor) {
+        pub fn origin(right: usize, bottom: usize) -> (String, Cursor) {
             (
                 String::from("\x1b[H"),
                 Cursor {
                     row: 0,
                     col: 0,
                     visibility: true,
+                    bounds: Bounds::new(0, 0, right, bottom, 0, 0),
                 },
             )
         }
-        pub fn move_by(&self, col: i32, row: i32 /* bounds:(left,top,right,bottom) */) -> (String, Cursor) {
-            self.move_to(
-                std::cmp::max(self.col as i32 + col, 0) as usize,
-                std::cmp::max(self.row as i32 + row, 0) as usize,
-            )
+
+        pub fn update_bounds(&self, bounds: Bounds) -> Cursor {
+            Cursor {
+                row: self.row.clamp(bounds.top, bounds.bottom),
+                col: self.col.clamp(bounds.left, bounds.right),
+                visibility: self.visibility,
+                bounds: bounds,
+            }
         }
 
-        pub fn move_to(&self, col: usize, row: usize /* bounds:(left,top,right,bottom) */) -> (String, Cursor) {
-            let next = Cursor {
-                row: row,
-                col: col,
-                visibility: self.visibility,
+        pub fn move_by(&self, col: i32, row: i32) -> (String, Cursor) {
+            match (
+                self.col as i32 + col,
+                (self.row as i32 + row).clamp(self.bounds.top as i32, self.bounds.bottom as i32),
+            ) {
+                (col, row) if self.bounds.contains(col, row) => self.move_to(col as usize, row as usize),
+                (col, row) if col > self.bounds.right as i32 => {
+                    // move to next line start
+                    self.move_to(
+                        self.bounds.left,
+                        std::cmp::min(row + 1, self.bounds.bottom as i32) as usize,
+                    )
+                }
+                (col, row) if col < self.bounds.left as i32 => {
+                    // move to prev line end
+                    self.move_to(self.bounds.right_prev_line, std::cmp::max(row - 1, 0) as usize)
+                }
+                _ => self.move_to(
+                    (self.col as i32 + col).clamp(self.bounds.left as i32, self.bounds.right as i32) as usize,
+                    (self.row as i32 + row).clamp(self.bounds.top as i32, self.bounds.bottom as i32) as usize,
+                ),
+            }
+        }
+
+        pub fn move_cmd(&self, offset: usize) -> String {
+            format!("\x1b[{};{}H", self.row - offset + 1, self.col + 1)
+        }
+
+        pub fn move_to(&self, col: usize, row: usize) -> (String, Cursor) {
+            let next = match row {
+                next_row if next_row > self.row => Cursor {
+                    row: next_row.clamp(self.bounds.top, self.bounds.bottom),
+                    col: col.clamp(self.bounds.left, self.bounds.right_next_line),
+                    visibility: self.visibility,
+                    bounds: self.bounds.clone(),
+                },
+                prev_row if prev_row < self.row => Cursor {
+                    row: prev_row.clamp(self.bounds.top, self.bounds.bottom),
+                    col: col.clamp(self.bounds.left, self.bounds.right_prev_line),
+                    visibility: self.visibility,
+                    bounds: self.bounds.clone(),
+                },
+                row => Cursor {
+                    row: row.clamp(self.bounds.top, self.bounds.bottom),
+                    col: col.clamp(self.bounds.left, self.bounds.right),
+                    visibility: self.visibility,
+                    bounds: self.bounds.clone(),
+                },
             };
-            let cmd = format!("\x1b[{};{}H", next.row, next.col);
+            let cmd = format!("\x1b[{};{}H", next.row + 1, next.col + 1);
             (cmd, next)
         }
 
@@ -385,17 +518,18 @@ mod terminal {
                     row: self.row,
                     col: self.col,
                     visibility: false,
+                    bounds: self.bounds.clone(),
                 },
             )
         }
         pub fn show(&self) -> (String, Cursor) {
-            let (cmd, cursor) = self.move_to(self.col, self.row);
             (
-                cmd + &format!("\x1b[?25h"),
+                format!("\x1b[?25h"),
                 Cursor {
-                    col: cursor.col,
-                    row: cursor.row,
+                    col: self.col,
+                    row: self.row,
                     visibility: true,
+                    bounds: self.bounds.clone(),
                 },
             )
         }
@@ -415,8 +549,6 @@ mod terminal {
     type ColCount = usize;
     type RowCount = usize;
 
-    // TODO(i10416): https://viewsourcecode.org/snaptoken/kilo/03.rawInputAndOutput.html#window-size-the-hard-way
-
     pub fn get_terminal_size() -> Option<TermSize> {
         let mut size = TermSize::default();
         match unsafe { terminal_size(&mut size) } {
@@ -429,7 +561,7 @@ mod terminal {
     }
 
     pub fn get_term_size_fallback() -> Result<(u16, u16), std::io::Error> {
-        let (cmd, _) = Cursor::origin().1.move_by(999, 999);
+        let (cmd, _) = Cursor::origin(999, 999).1.move_by(999, 999);
         // attempt to move cursor at right bottom
         io::stdout().write(cmd.as_bytes())?;
 
