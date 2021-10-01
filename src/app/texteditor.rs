@@ -7,14 +7,17 @@
 antirez's kilo を少し改変したテキストエディタをRustで書く.
 
  */
-
-// todo: set cursor bounds
+// todo: fix horizontal scroll
+// todo: insert chars
+// todo: delete chars
+// todo: save
 // todo: handle horizontal scroll
 // todo: replace recursion with loop
 // todo: use stream and event
 use std::fmt::Debug;
 use std::io::{self, BufRead, Read, Write};
 use std::os::raw::{c_char, c_uint};
+use std::os::unix::raw::mode_t;
 
 type Cflag = c_uint;
 type Speed = c_uint;
@@ -78,6 +81,12 @@ extern "C" {
     fn enable_raw_mode(original: *mut Termios) -> i32;
     fn restore(original: *const Termios) -> i32;
 }
+
+#[derive(Debug, PartialEq)]
+enum Mode {
+    Insert,
+    Visual,
+}
 /**
 * represent app state
 */
@@ -89,6 +98,7 @@ struct State<'a> {
     rows: Vec<String>,
     viewport: Viewport,
     statusbar: StatusBar<'a>,
+    mode: Mode,
 }
 
 impl<'a> State<'a> {
@@ -99,6 +109,7 @@ impl<'a> State<'a> {
         rows: Vec<String>,
         viewport: Viewport,
         statusbar: StatusBar<'a>,
+        mode: Mode,
     ) -> State<'a> {
         State {
             termios: t,
@@ -107,6 +118,7 @@ impl<'a> State<'a> {
             rows: rows,
             viewport: viewport,
             statusbar: statusbar,
+            mode: Mode::Visual,
         }
     }
 }
@@ -119,7 +131,7 @@ struct StatusBar<'a> {
     width: usize,
 }
 impl<'a> StatusBar<'a> {
-    pub fn render(&self) -> String {
+    pub fn render(&self, mode: &Mode) -> String {
         let truncated_filename = self
             .filename
             .map(|s| {
@@ -130,11 +142,17 @@ impl<'a> StatusBar<'a> {
                 }
             })
             .unwrap_or("[No Name]");
+        let mode_type = match mode {
+            Mode::Insert => "insert",
+            Mode::Visual => "visual",
+        };
+
         format!(
-            "\x1b[7m{}{}{} lines\x1b[m",
+            "\x1b[7m{}{}{} lines[{}]\x1b[m",
             truncated_filename,
-            " ".repeat(self.width - 6 - truncated_filename.len() - self.lines.to_string().len()),
-            self.lines
+            " ".repeat(self.width - 8 - truncated_filename.len() - self.lines.to_string().len() - mode_type.len()),
+            self.lines,
+            mode_type
         )
     }
 }
@@ -168,16 +186,19 @@ fn main() -> Result<(), ()> {
         .into_iter()
         .map(|row| replace_tabs(row))
         .collect();
-    let (_, cursor) = terminal::Cursor::origin(rows.first().map_or(0, |s| s.len()), rows.len() - 1);
+    let pad_size = rows.len().to_string().len();
     io::stdout()
         .write(clean_display().as_bytes())
         .and_then(|_| io::stdout().flush())
         .expect("success");
+    let content_width = std::cmp::max((term_size.col as i32) - (pad_size as i32) - 2, 0) as usize;
     let viewport = Viewport {
         offset: (0, 0),
-        size: (term_size.col.into(), (term_size.row - 1).into()),
+        size: (content_width, (term_size.row - 1).into()),
         max_height: rows.len() - 1,
     };
+    let (_, cursor) = terminal::Cursor::origin(pad_size + 2, rows.first().map_or(0, |s| s.len()), rows.len() - 1);
+
     let statusbar = StatusBar {
         lines: rows.len(),
         filename: None,
@@ -185,22 +206,21 @@ fn main() -> Result<(), ()> {
         has_change: false,
         width: term_size.col.into(),
     };
-    let state = State::new(original, term_size, cursor, rows, viewport, statusbar);
+    let state = State::new(original, term_size, cursor, rows, viewport, statusbar, Mode::Visual);
 
     match tick(state) {
         Ok((message, state)) => {
-            let clean_cmd = clean_display();
             unsafe {
                 restore(&state.termios);
             }
-            println!("{}", clean_cmd + &message);
+            println!("{}", clean_display() + &message);
             Ok(())
         }
         Err(_) => unimplemented!(),
     }
 }
 fn clean_display() -> String {
-    String::from("\x1b[2J")
+    String::from("\x1b[2J\x1b[0;0H")
 }
 /*
 * read file into Vec<String>. each element of the vec represents a row.
@@ -222,19 +242,38 @@ fn read_file(file_path: &str) -> Result<Vec<String>, std::io::Error> {
 /*
 * prepend leading symbol ~<row_number>: and append clean_line escape sequence to row
 */
-fn build_row(content: &str, idx: usize) -> String {
-    format!("~{}:{} {}", idx, content, clean_line())
+fn build_row(content: &str, idx: usize, pad_size: usize, viewport: &Viewport) -> String {
+    let visibleContent = match (viewport.offset.0, viewport.size.0) {
+        (col_offset, _) if col_offset >= content.len() => "",
+        (col_offset, viewport_width) => content
+            .get(col_offset..std::cmp::min(content.len(), col_offset + viewport_width))
+            .unwrap(),
+    };
+    format!(
+        "~{}:{}{}",
+        format!("{:0>width$}", idx, width = pad_size),
+        visibleContent,
+        clean_line()
+    )
 }
 
-fn build_screen(rows: Vec<String>, offset: usize, height: usize, statusbar: &StatusBar) -> String {
+fn build_screen(
+    rows: Vec<String>,
+    pad_size: usize,
+    offset: usize,
+    height: usize,
+    viewport: &Viewport,
+    mode: &Mode,
+    statusbar: &StatusBar,
+) -> String {
     rows.into_iter()
         .skip(offset)
         .take(height - 1)
         .zip((offset + 1)..)
         .fold(String::from("\x1b[0;0H"), |acc, (row, idx)| {
-            acc + &build_row(&row, idx) + "\r\n"
+            acc + &build_row(&row, idx, pad_size, viewport) + "\r\n"
         })
-        + &(statusbar.render())
+        + &(statusbar.render(mode))
 }
 
 fn clean_line() -> String {
@@ -289,13 +328,16 @@ fn tick(state: State) -> Result<(String, State), String> {
     } else {
         state.rows[cursor.row - 1].len()
     };
+    let pad_size = state.rows.len().to_string().len();
     let next_line_length = state.rows[std::cmp::min(cursor.row + 1, cursor.bounds.bottom)].len();
-    let bounds = cursor
-        .bounds
-        .update_right_bounds(current_line_length + 3, prev_line_length + 3, next_line_length + 3);
+    let bounds = cursor.bounds.update_right_bounds(
+        current_line_length + pad_size + 2,
+        prev_line_length + pad_size + 2,
+        next_line_length + pad_size + 2,
+    );
     let cursor = cursor.update_bounds(bounds);
     match io::stdin().bytes().next() {
-        Some(Ok(input)) if input == b'q' & 0x1f => Ok((cursor.move_to(0, 0).0 + "Bye!", state)),
+        Some(Ok(input)) if input == b'q' & 0x1f => Ok((String::from("Bye!"), state)),
         Some(Ok(input)) if input == b'u' & 0x1f || input == b'd' & 0x1f => {
             let dy = if input == b'u' & 0x1f {
                 -(state.size.row as i32)
@@ -308,8 +350,11 @@ fn tick(state: State) -> Result<(String, State), String> {
             let move_cmd = cursor.move_cmd(viewport.offset.1);
             let render_textarea_cmd = build_screen(
                 state.rows.clone(),
+                pad_size,
                 viewport.offset.1,
                 state.size.row.into(),
+                &viewport,
+                &state.mode,
                 &state.statusbar,
             );
             let (show_cursor_cmd, cursor) = cursor.show();
@@ -321,6 +366,7 @@ fn tick(state: State) -> Result<(String, State), String> {
                 rows: state.rows,
                 viewport: viewport,
                 statusbar: state.statusbar,
+                mode: state.mode,
             })
         }
         // todo: ネストが深くてつらいのであり得ないケースは unwrap,expect などで雑にハンドリングする
@@ -340,8 +386,11 @@ fn tick(state: State) -> Result<(String, State), String> {
 
                         let render_textarea_cmd = build_screen(
                             state.rows.clone(),
+                            pad_size,
                             viewport.offset.1,
                             state.size.row.into(),
+                            &viewport,
+                            &state.mode,
                             &state.statusbar,
                         );
                         let (show_cursor_cmd, cursor) = cursor.show();
@@ -353,18 +402,21 @@ fn tick(state: State) -> Result<(String, State), String> {
                             rows: state.rows,
                             viewport: viewport,
                             statusbar: state.statusbar,
+                            mode: state.mode,
                         })
                     }
                     // handle delete key
                     Some(Ok(b'3')) => match io::stdin().bytes().peekable().peek() {
                         Some(Ok(b'~')) => {
-                            let (_, cursor) = cursor.move_by(0, 0);
                             let move_cmd = cursor.move_cmd(state.viewport.offset.1);
 
                             let render_textarea_cmd = build_screen(
                                 state.rows.clone(),
+                                pad_size,
                                 state.viewport.offset.1,
                                 state.size.row.into(),
+                                &state.viewport,
+                                &state.mode,
                                 &state.statusbar,
                             );
                             let (show_cursor_cmd, cursor) = cursor.show();
@@ -377,6 +429,7 @@ fn tick(state: State) -> Result<(String, State), String> {
                                 rows: state.rows,
                                 viewport: state.viewport,
                                 statusbar: state.statusbar,
+                                mode: state.mode,
                             })
                         }
                         _ => unimplemented!(),
@@ -387,8 +440,104 @@ fn tick(state: State) -> Result<(String, State), String> {
                 },
                 Some(Ok(_)) => unimplemented!(),
                 Some(Err(_)) => unimplemented!(),
-                None => unimplemented!(),
+                None => {
+                    let move_cmd = cursor.move_cmd(state.viewport.offset.1);
+
+                    let render_textarea_cmd = build_screen(
+                        state.rows.clone(),
+                        pad_size,
+                        state.viewport.offset.1,
+                        state.size.row.into(),
+                        &state.viewport,
+                        &state.mode,
+                        &state.statusbar,
+                    );
+                    let (show_cursor_cmd, cursor) = cursor.show();
+
+                    render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
+                    tick(State {
+                        size: state.size,
+                        cursor: cursor,
+                        termios: state.termios,
+                        rows: state.rows,
+                        viewport: state.viewport,
+                        statusbar: state.statusbar,
+                        mode: Mode::Visual,
+                    })
+                }
             }
+        }
+        Some(Ok(input)) if input == b'i' && state.mode == Mode::Visual => {
+            let move_cmd = cursor.move_cmd(state.viewport.offset.1);
+
+            let render_textarea_cmd = build_screen(
+                state.rows.clone(),
+                pad_size,
+                state.viewport.offset.1,
+                state.size.row.into(),
+                &state.viewport,
+                &state.mode,
+                &state.statusbar,
+            );
+            let (show_cursor_cmd, cursor) = cursor.show();
+
+            render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
+            tick(State {
+                size: state.size,
+                cursor: cursor,
+                termios: state.termios,
+                rows: state.rows,
+                viewport: state.viewport,
+                statusbar: state.statusbar,
+                mode: Mode::Insert,
+            })
+        }
+        Some(Ok(input)) if state.mode == Mode::Insert => {
+            let rows: Vec<String> = state
+                .rows
+                .into_iter()
+                .zip(0..)
+                .map(|(row, idx)| {
+                    if idx == cursor.row {
+                        if cursor.col + 1 > row.len() {
+                            format!("{}{}", row, input as char)
+                        } else {
+                            let (front, back) = row.split_at(cursor.col);
+                            [front, &(input as char).to_string(), back].join("")
+                        }
+                    } else {
+                        row
+                    }
+                })
+                .collect();
+            let cursor = cursor.update_bounds(cursor.bounds.update_right_bounds(
+                cursor.bounds.right + 1,
+                cursor.bounds.right_prev_line,
+                cursor.bounds.right_next_line,
+            ));
+            let (move_cmd, cursor) = cursor.move_by(1, 0);
+
+            let render_textarea_cmd = build_screen(
+                rows.clone(),
+                pad_size,
+                state.viewport.offset.1,
+                state.size.row.into(),
+                &state.viewport,
+                &state.mode,
+                &state.statusbar,
+            );
+            let (show_cursor_cmd, cursor) = cursor.show();
+
+            render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
+            tick(State {
+                size: state.size,
+                cursor: cursor,
+                termios: state.termios,
+                rows: rows,
+                viewport: state.viewport,
+                statusbar: state.statusbar,
+                mode: Mode::Insert,
+            })
         }
         Some(Ok(input)) => {
             let (dx, dy) = key_to_move(input);
@@ -402,8 +551,11 @@ fn tick(state: State) -> Result<(String, State), String> {
 
             let render_textarea_cmd = build_screen(
                 state.rows.clone(),
+                pad_size,
                 viewport.offset.1,
                 state.size.row.into(),
+                &viewport,
+                &state.mode,
                 &state.statusbar,
             );
             let (show_cursor_cmd, cursor) = cursor.show();
@@ -415,6 +567,7 @@ fn tick(state: State) -> Result<(String, State), String> {
                 rows: state.rows,
                 viewport: viewport,
                 statusbar: state.statusbar,
+                mode: state.mode,
             })
         }
         Some(Err(_)) => unimplemented!(),
@@ -422,8 +575,11 @@ fn tick(state: State) -> Result<(String, State), String> {
             let move_cmd = cursor.move_cmd(state.viewport.offset.1);
             let render_textarea_cmd = build_screen(
                 state.rows.clone(),
+                pad_size,
                 state.viewport.offset.1,
                 state.size.row.into(),
+                &state.viewport,
+                &state.mode,
                 &state.statusbar,
             );
             let (show_cursor_cmd, cursor) = cursor.show();
@@ -435,6 +591,7 @@ fn tick(state: State) -> Result<(String, State), String> {
                 rows: state.rows,
                 viewport: state.viewport,
                 statusbar: state.statusbar,
+                mode: state.mode,
             })
         }
     }
@@ -504,14 +661,14 @@ mod terminal {
 
     // todo: handle terminal size bounds
     impl Cursor {
-        pub fn origin(right: usize, bottom: usize) -> (String, Cursor) {
+        pub fn origin(left: usize, right: usize, bottom: usize) -> (String, Cursor) {
             (
                 String::from("\x1b[H"),
                 Cursor {
                     row: 0,
                     col: 0,
                     visibility: true,
-                    bounds: Bounds::new(0, 0, right, bottom, 0, 0),
+                    bounds: Bounds::new(left, 0, right, bottom, 0, 0),
                 },
             )
         }
@@ -628,7 +785,7 @@ mod terminal {
     }
 
     pub fn get_term_size_fallback() -> Result<(u16, u16), std::io::Error> {
-        let (cmd, _) = Cursor::origin(999, 999).1.move_by(999, 999);
+        let (cmd, _) = Cursor::origin(0, 999, 999).1.move_by(999, 999);
         // attempt to move cursor at right bottom
         io::stdout().write(cmd.as_bytes())?;
 
