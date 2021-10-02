@@ -8,7 +8,6 @@ antirez's kilo を少し改変したテキストエディタをRustで書く.
 
  */
 // todo: save
-// todo: handle horizontal scroll
 // todo: replace recursion with loop
 // todo: use stream and event
 use std::fmt::Debug;
@@ -24,6 +23,7 @@ const CLEAN_LINE_CMD: &str = "\x1b[K";
 const CTRL_Q: u8 = b'q' & 0x1f;
 const CTRL_U: u8 = b'u' & 0x1f;
 const CTRL_D: u8 = b'd' & 0x1f;
+const CTRL_S: u8 = b's' & 0x1f;
 // prevent memory layout optimization
 #[repr(C)]
 #[derive(Debug, Default)]
@@ -47,7 +47,7 @@ extern "C" {
 #[derive(Debug, PartialEq)]
 enum Mode {
     Insert,
-    Visual,
+    Normal,
 }
 /**
 * represent app state
@@ -59,7 +59,7 @@ struct State<'a> {
     size: terminal::TermSize,
     rows: Vec<String>,
     viewport: terminal::Viewport,
-    statusbar: StatusBar<'a>,
+    status: Status<'a>,
     mode: &'a Mode,
 }
 
@@ -70,7 +70,7 @@ impl<'a> State<'a> {
         cursor: terminal::Cursor,
         rows: Vec<String>,
         viewport: terminal::Viewport,
-        statusbar: StatusBar<'a>,
+        statusbar: Status<'a>,
         mode: Mode,
     ) -> State<'a> {
         State {
@@ -79,13 +79,13 @@ impl<'a> State<'a> {
             cursor: cursor,
             rows: rows,
             viewport: viewport,
-            statusbar: statusbar,
-            mode: &Mode::Visual,
+            status: statusbar,
+            mode: &Mode::Normal,
         }
     }
 }
 #[derive(Debug)]
-struct StatusBar<'a> {
+struct Status<'a> {
     lines: usize,
     filename: Option<&'a str>,
     filetype: Option<&'a str>,
@@ -93,8 +93,8 @@ struct StatusBar<'a> {
     width: usize,
 }
 
-impl<'a> StatusBar<'a> {
-    fn render(&self, mode: &Mode, cursor: &terminal::Cursor) -> String {
+impl<'a> Status<'a> {
+    fn renderStatusBar(&self, mode: &Mode, cursor: &terminal::Cursor) -> String {
         let truncated_filename = self
             .filename
             .map(|s| {
@@ -107,7 +107,7 @@ impl<'a> StatusBar<'a> {
             .unwrap_or("[No Name]");
         let mode_type = match mode {
             Mode::Insert => "insert",
-            Mode::Visual => "visual",
+            Mode::Normal => "visual",
         };
 
         format!(
@@ -177,14 +177,14 @@ fn main() -> Result<(), ()> {
     };
     let (_, cursor) = terminal::Cursor::origin(pad_size + 2, rows.first().map_or(0, |s| s.len()), rows.len() - 1);
 
-    let statusbar = StatusBar {
+    let status = Status {
         lines: rows.len(),
-        filename: None,
+        filename: Some("README.md"),
         filetype: None,
         has_change: false,
         width: term_size.col.into(),
     };
-    let state = State::new(original, term_size, cursor, rows, viewport, statusbar, Mode::Visual);
+    let state = State::new(original, term_size, cursor, rows, viewport, status, Mode::Normal);
 
     match tick(state) {
         Ok((message, state)) => {
@@ -218,9 +218,9 @@ fn read_file(file_path: &str) -> Result<Vec<String>, std::io::Error> {
     }
 }
 
-fn write_file(file_path: String, text: String) -> Result<(), std::io::Error> {
-    let f = std::fs::File::open(file_path);
-    unimplemented!()
+fn write_file(file_path: &str, text: String) -> Result<(), std::io::Error> {
+    let mut f = std::fs::File::create(file_path)?;
+    write!(f, "{}", text).and_then(|_| f.flush())
 }
 
 /*
@@ -246,7 +246,7 @@ fn build_screen(
     pad_size: usize,
     viewport: &terminal::Viewport,
     mode: &Mode,
-    statusbar: &StatusBar,
+    statusbar: &Status,
     cursor: &terminal::Cursor,
 ) -> String {
     let offset = viewport.offset.1;
@@ -257,7 +257,7 @@ fn build_screen(
         .fold(String::from("\x1b[0;0H"), |acc, (row, idx)| {
             acc + &build_row(&row, idx, pad_size, viewport) + "\r\n"
         })
-        + &(statusbar.render(mode, cursor))
+        + &(statusbar.renderStatusBar(mode, cursor))
 }
 
 fn build_welcome_message(col_count: u16, row_number: usize) -> String {
@@ -300,7 +300,11 @@ fn render(cmd: String) {
 }
 
 fn is_valid_char(c: u8) -> bool {
-    c.is_ascii_alphabetic() || c.is_ascii_alphanumeric() || c.is_ascii_digit()
+    c.is_ascii_alphabetic()
+        || c.is_ascii_alphanumeric()
+        || c.is_ascii_digit()
+        || c.is_ascii_whitespace()
+        || c.is_ascii_punctuation()
 }
 
 fn tick(state: State) -> Result<(String, State), String> {
@@ -313,7 +317,7 @@ fn tick(state: State) -> Result<(String, State), String> {
         state.rows[cursor.row - 1].len()
     };
     let pad_size = state.rows.len().to_string().len();
-    let next_line_length = state.rows[std::cmp::min(cursor.row + 1, cursor.bounds.bottom)].len();
+    let next_line_length = state.rows[std::cmp::min(cursor.row, cursor.bounds.bottom)].len();
     let bounds = cursor.bounds.update_right_bounds(
         current_line_length + pad_size + 2,
         prev_line_length + pad_size + 2,
@@ -336,19 +340,15 @@ fn tick(state: State) -> Result<(String, State), String> {
                 pad_size,
                 &viewport,
                 &state.mode,
-                &state.statusbar,
+                &state.status,
                 &cursor,
             );
             let (show_cursor_cmd, cursor) = cursor.show();
             render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
             tick(State {
-                size: state.size,
                 cursor: cursor,
-                termios: state.termios,
-                rows: state.rows,
                 viewport: viewport,
-                statusbar: state.statusbar,
-                mode: state.mode,
+                ..state
             })
         }
         // todo: ネストが深くてつらいのであり得ないケースは unwrap,expect などで雑にハンドリングする
@@ -366,19 +366,15 @@ fn tick(state: State) -> Result<(String, State), String> {
                             pad_size,
                             &viewport,
                             &state.mode,
-                            &state.statusbar,
+                            &state.status,
                             &cursor,
                         );
                         let (show_cursor_cmd, cursor) = cursor.show();
                         render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
                         tick(State {
-                            size: state.size,
                             cursor: cursor,
-                            termios: state.termios,
-                            rows: state.rows,
                             viewport: viewport,
-                            statusbar: state.statusbar,
-                            mode: state.mode,
+                            ..state
                         })
                     }
                     // handle delete key
@@ -391,20 +387,16 @@ fn tick(state: State) -> Result<(String, State), String> {
                                 pad_size,
                                 &state.viewport,
                                 &state.mode,
-                                &state.statusbar,
+                                &state.status,
                                 &cursor,
                             );
                             let (show_cursor_cmd, cursor) = cursor.show();
 
                             render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
                             tick(State {
-                                size: state.size,
                                 cursor: cursor,
-                                termios: state.termios,
-                                rows: state.rows,
-                                viewport: state.viewport,
-                                statusbar: state.statusbar,
                                 mode: state.mode,
+                                ..state
                             })
                         }
                         _ => unimplemented!(),
@@ -424,25 +416,21 @@ fn tick(state: State) -> Result<(String, State), String> {
                         pad_size,
                         &state.viewport,
                         &state.mode,
-                        &state.statusbar,
+                        &state.status,
                         &cursor,
                     );
                     let (show_cursor_cmd, cursor) = cursor.show();
 
                     render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
                     tick(State {
-                        size: state.size,
                         cursor: cursor,
-                        termios: state.termios,
-                        rows: state.rows,
-                        viewport: state.viewport,
-                        statusbar: state.statusbar,
-                        mode: &Mode::Visual,
+                        mode: &Mode::Normal,
+                        ..state
                     })
                 }
             }
         }
-        Some(Ok(b'i')) if state.mode.eq(&Mode::Visual) => {
+        Some(Ok(b'i')) if state.mode.eq(&Mode::Normal) => {
             let move_cmd = cursor.move_cmd(state.viewport.offset.1);
 
             let render_textarea_cmd = build_screen(
@@ -450,44 +438,58 @@ fn tick(state: State) -> Result<(String, State), String> {
                 pad_size,
                 &state.viewport,
                 &state.mode,
-                &state.statusbar,
+                &state.status,
                 &cursor,
             );
             let (show_cursor_cmd, cursor) = cursor.show();
 
             render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
             tick(State {
-                size: state.size,
                 cursor: cursor,
-                termios: state.termios,
-                rows: state.rows,
-                viewport: state.viewport,
-                statusbar: state.statusbar,
                 mode: &Mode::Insert,
+                ..state
+            })
+        }
+        // insert mode & None => switch to normal mode  save as prompt
+        // normal mode & Some(filename) => save as prompt
+        Some(Ok(CTRL_S)) if state.status.filename.is_some() && state.mode.eq(&Mode::Insert) => {
+            let move_cmd = cursor.move_cmd(state.viewport.offset.1);
+            write_file(state.status.filename.unwrap(), state.rows.join("\n")).unwrap();
+            let render_textarea_cmd = build_screen(
+                state.rows.clone(),
+                pad_size,
+                &state.viewport,
+                &state.mode,
+                &state.status,
+                &cursor,
+            );
+            let (show_cursor_cmd, cursor) = cursor.show();
+
+            render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
+            tick(State {
+                cursor: cursor,
+                mode: &Mode::Insert,
+                ..state
             })
         }
         // backspace
-        Some(Ok(input)) if input == b'h' & 0x1f || input == 127 && state.mode.eq(&Mode::Visual) => {
+        Some(Ok(input)) if input == b'h' & 0x1f || input == 127 && state.mode.eq(&Mode::Normal) => {
             let (move_cmd, cursor, viewport) = cursor.move_by(-1, 0, state.viewport);
             let render_textarea_cmd = build_screen(
                 state.rows.clone(),
                 pad_size,
                 &viewport,
                 &state.mode,
-                &state.statusbar,
+                &state.status,
                 &cursor,
             );
             let (show_cursor_cmd, cursor) = cursor.show();
 
             render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
             tick(State {
-                size: state.size,
                 cursor: cursor,
-                termios: state.termios,
-                rows: state.rows,
                 viewport: viewport,
-                statusbar: state.statusbar,
-                mode: state.mode,
+                ..state
             })
         }
         Some(Ok(input)) if input == b'h' & 0x1f || input == 127 && state.mode.eq(&Mode::Insert) => {
@@ -503,10 +505,8 @@ fn tick(state: State) -> Result<(String, State), String> {
                             cursor.bounds.right_next_line,
                         )),
                     ),
-                    (front, tail) => (
-                        [front,tail].concat(),
-                        next_cursor,
-                    ),
+                    (front, [row, remains @ ..]) if row.is_empty() => ([front, remains].concat(), next_cursor),
+                    (front, [remains @ ..]) => ([front, remains].concat(), next_cursor),
                 }
             } else {
                 match state.rows.split_at(next_cursor.row) {
@@ -532,25 +532,77 @@ fn tick(state: State) -> Result<(String, State), String> {
                     }
                 }
             };
-            let render_textarea_cmd = build_screen(
-                rows.clone(),
-                pad_size,
-                &viewport,
-                &state.mode,
-                &state.statusbar,
-                &cursor,
-            );
+            let render_textarea_cmd =
+                build_screen(rows.clone(), pad_size, &viewport, &state.mode, &state.status, &cursor);
             let (show_cursor_cmd, cursor) = cursor.show();
 
             render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
             tick(State {
-                size: state.size,
                 cursor: cursor,
-                termios: state.termios,
                 rows: rows,
                 viewport: viewport,
-                statusbar: state.statusbar,
-                mode: state.mode,
+                ..state
+            })
+        }
+        // Enter
+        Some(Ok(b'\r')) if state.mode.eq(&Mode::Insert) => {
+            let prev_pad_size = pad_size;
+            let pad_size = (state.rows.len() + 1).to_string().len();
+            let padd_diff = pad_size - prev_pad_size;
+            let (rows, (move_cmd, cursor, viewport)) = match state.rows.split_at(cursor.row) {
+                (front, &[]) => (
+                    [front, &["".to_string()]].concat(),
+                    cursor
+                        .update_bounds(terminal::Bounds {
+                            bottom: cursor.bounds.bottom + 1,
+                            left: pad_size + 2,
+                            right: cursor.bounds.right + padd_diff,
+                            right_next_line: cursor.bounds.right_next_line + padd_diff,
+                            right_prev_line: cursor.bounds.right_prev_line + padd_diff,
+                            ..cursor.bounds
+                        })
+                        .move_by(
+                            0,
+                            1,
+                            terminal::Viewport {
+                                max_height: state.viewport.max_height + 1,
+                                ..state.viewport
+                            },
+                        ),
+                ),
+                (front, [row, back @ ..]) => (
+                    [front, &[row.into()], &["".to_string()], back].concat(),
+                    cursor
+                        .update_bounds(terminal::Bounds {
+                            bottom: cursor.bounds.bottom + 1,
+                            left: pad_size + 2,
+                            right: cursor.bounds.right + padd_diff,
+                            right_next_line: cursor.bounds.right_next_line + padd_diff,
+                            right_prev_line: cursor.bounds.right_prev_line + padd_diff,
+                            ..cursor.bounds
+                        })
+                        .move_by(
+                            0,
+                            1,
+                            terminal::Viewport {
+                                max_height: state.viewport.max_height + 1,
+                                ..state.viewport
+                            },
+                        ),
+                ),
+            };
+
+            let render_textarea_cmd =
+                build_screen(rows.clone(), pad_size, &viewport, &state.mode, &state.status, &cursor);
+            let (show_cursor_cmd, cursor) = cursor.show();
+
+            render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
+            tick(State {
+                cursor: cursor,
+                rows: rows,
+                viewport: viewport,
+                mode: &Mode::Insert,
+                ..state
             })
         }
         Some(Ok(input)) if state.mode.eq(&Mode::Insert) && is_valid_char(input) => {
@@ -578,25 +630,17 @@ fn tick(state: State) -> Result<(String, State), String> {
             ));
             let (move_cmd, cursor, viewport) = cursor.move_by(1, 0, state.viewport);
 
-            let render_textarea_cmd = build_screen(
-                rows.clone(),
-                pad_size,
-                &viewport,
-                &state.mode,
-                &state.statusbar,
-                &cursor,
-            );
+            let render_textarea_cmd =
+                build_screen(rows.clone(), pad_size, &viewport, &state.mode, &state.status, &cursor);
             let (show_cursor_cmd, cursor) = cursor.show();
 
             render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
             tick(State {
-                size: state.size,
                 cursor: cursor,
-                termios: state.termios,
                 rows: rows,
                 viewport: viewport,
-                statusbar: state.statusbar,
                 mode: &Mode::Insert,
+                ..state
             })
         }
         Some(Ok(input)) => {
@@ -609,19 +653,15 @@ fn tick(state: State) -> Result<(String, State), String> {
                 pad_size,
                 &viewport,
                 &state.mode,
-                &state.statusbar,
+                &state.status,
                 &cursor,
             );
             let (show_cursor_cmd, cursor) = cursor.show();
             render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
             tick(State {
-                size: state.size,
                 cursor: cursor,
-                termios: state.termios,
-                rows: state.rows,
                 viewport: viewport,
-                statusbar: state.statusbar,
-                mode: state.mode,
+                ..state
             })
         }
         Some(Err(_)) => unimplemented!(),
@@ -632,19 +672,14 @@ fn tick(state: State) -> Result<(String, State), String> {
                 pad_size,
                 &state.viewport,
                 &state.mode,
-                &state.statusbar,
+                &state.status,
                 &cursor,
             );
             let (show_cursor_cmd, cursor) = cursor.show();
             render(hide_cursor_cmd + &render_textarea_cmd + &move_cmd + &show_cursor_cmd);
             tick(State {
-                size: state.size,
                 cursor: cursor,
-                termios: state.termios,
-                rows: state.rows,
-                viewport: state.viewport,
-                statusbar: state.statusbar,
-                mode: state.mode,
+                ..state
             })
         }
     }
