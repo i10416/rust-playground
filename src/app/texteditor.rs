@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 // refs
 // build own text editor: kilo.
 // https://viewsourcecode.org/snaptoken/kilo/
@@ -7,11 +8,11 @@
 antirez's kilo を少し改変したテキストエディタをRustで書く.
 
  */
-// todo: save
 // todo: replace recursion with loop
 // todo: use stream and event
 use std::fmt::Debug;
 use std::io::{self, BufRead, Read, Write};
+use std::ops::Range;
 use std::os::raw::{c_char, c_uint};
 
 type Cflag = c_uint;
@@ -94,7 +95,7 @@ struct Status<'a> {
 }
 
 impl<'a> Status<'a> {
-    fn renderStatusBar(&self, mode: &Mode, cursor: &terminal::Cursor) -> String {
+    fn render_status_bar(&self, mode: &Mode, cursor: &terminal::Cursor) -> String {
         let truncated_filename = self
             .filename
             .map(|s| {
@@ -223,16 +224,37 @@ fn write_file(file_path: &str, text: String) -> Result<(), std::io::Error> {
     write!(f, "{}", text).and_then(|_| f.flush())
 }
 
+fn decorate_char(c: char) -> String {
+    match c {
+        c if c.is_numeric() => format!("\x1b[31m{}\x1b[39m", c),
+        _ => c.into(),
+    }
+}
+
+
+fn get_visible_range(content: &str, viewport: &terminal::Viewport) -> Option<Range<usize>> {
+    match (viewport.offset.0, viewport.size.0) {
+        (col_offset, _) if col_offset >= content.len() => None,
+        (col_offset, viewport_width) => Some(col_offset..std::cmp::min(content.len(), col_offset + viewport_width)),
+    }
+}
+
+fn get_visible_content(content: &str, viewport: &terminal::Viewport) -> String {
+    match get_visible_range(content, viewport) {
+        Some(range) => content
+            .get(range)
+            .unwrap()
+            .chars()
+            .map(|c| decorate_char(c))
+            .collect::<String>(),
+        None => "".to_string(),
+    }
+}
 /*
 * prepend leading symbol ~<row_number>: and append clean_line escape sequence to row
 */
 fn build_row(content: &str, idx: usize, pad_size: usize, viewport: &terminal::Viewport) -> String {
-    let visible_content = match (viewport.offset.0, viewport.size.0) {
-        (col_offset, _) if col_offset >= content.len() => "",
-        (col_offset, viewport_width) => content
-            .get(col_offset..std::cmp::min(content.len(), col_offset + viewport_width))
-            .unwrap(),
-    };
+    let visible_content = get_visible_content(content, viewport);
     format!(
         "~{}:{}{}",
         format!("{:0>width$}", idx, width = pad_size),
@@ -257,7 +279,7 @@ fn build_screen(
         .fold(String::from("\x1b[0;0H"), |acc, (row, idx)| {
             acc + &build_row(&row, idx, pad_size, viewport) + "\r\n"
         })
-        + &(statusbar.renderStatusBar(mode, cursor))
+        + &(statusbar.render_status_bar(mode, cursor))
 }
 
 fn build_welcome_message(col_count: u16, row_number: usize) -> String {
